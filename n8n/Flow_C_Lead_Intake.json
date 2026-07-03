@@ -1,0 +1,91 @@
+{
+  "name": "Voice Agent \u2014 Flow C (Lead Intake)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "lead-intake",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "webhook",
+      "name": "Webhook: /lead-intake",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        240,
+        400
+      ],
+      "webhookId": "lead-intake",
+      "notes": "Public webhook to receive leads from any source: web form, Apollo Zapier, manual paste, etc."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:8100/leads",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"name\": \"{{ $json.body.name || $json.name }}\",\n  \"phone\": \"{{ $json.body.phone || $json.phone }}\",\n  \"email\": \"{{ $json.body.email || $json.email }}\",\n  \"company\": \"{{ $json.body.company || $json.company }}\",\n  \"source\": \"{{ $json.body.source || $json.source || 'webhook' }}\",\n  \"notes\": \"{{ $json.body.notes || $json.notes || '' }}\"\n}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json",
+              "fullResponse": false
+            }
+          },
+          "timeout": 15000,
+          "retry": {
+            "retry": {
+              "maxRetries": 2,
+              "waitBetweenRetries": 2000
+            }
+          }
+        }
+      },
+      "id": "http-collector",
+      "name": "POST /leads",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        480,
+        400
+      ],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "content": "## Flow C \u2014 Lead Intake (optional)\n\nThin webhook \u2192 calls the lead_collector service. Use it if you want to receive leads via webhook (form, Apollo + Zapier, etc.).\n\nFor a CSV / Apollo export, skip this and run:\n`python lead_collector.py import-csv leads.csv`\n\n**Env vars:**\n- `LEAD_COLLECTOR_URL` \u2014 e.g. `http://localhost:8100`",
+        "height": 220,
+        "width": 420,
+        "color": 6
+      },
+      "id": "note",
+      "name": "Flow C Notes",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        240,
+        20
+      ]
+    }
+  ],
+  "connections": {
+    "Webhook: /lead-intake": {
+      "main": [
+        [
+          {
+            "node": "POST /leads",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": [
+    "voice-agent"
+  ]
+}

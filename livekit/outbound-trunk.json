@@ -1,0 +1,10 @@
+{
+  "trunk": {
+    "name": "Technaptix Telnyx outbound",
+    "address": "sip.telnyx.com",
+    "auth_username": "userhanzalatechnaptix54108",
+    "auth_password": "6Y7G.^AX35PA",
+    "connection_id": "2983632731973355324",
+    "numbers": "+12792351375"
+  }
+}

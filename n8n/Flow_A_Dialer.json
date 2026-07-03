@@ -1,0 +1,419 @@
+{
+  "name": "Voice Agent \u2014 Flow A (SIP Dialer)",
+  "nodes": [
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            }
+          ]
+        },
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "1QMFaVb1qLF-ymVsKRPo2goqM4qBSodux7PTWih2xEQQ"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Lead"
+        },
+        "event": "rowAdded",
+        "options": {}
+      },
+      "id": "trigger-new-lead",
+      "name": "New Lead",
+      "type": "n8n-nodes-base.googleSheetsTrigger",
+      "typeVersion": 1,
+      "position": [
+        -800,
+        900
+      ],
+      "credentials": {
+        "googleSheetsTriggerOAuth2Api": {
+          "id": "OQHH1Skw9eIxRktg",
+          "name": "Google Sheets Trigger account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            }
+          ]
+        },
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "1QMFaVb1qLF-ymVsKRPo2goqM4qBSodux7PTWih2xEQQ"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Lead"
+        },
+        "event": "rowUpdate",
+        "options": {}
+      },
+      "id": "trigger-row-update",
+      "name": "Lead Updated",
+      "type": "n8n-nodes-base.googleSheetsTrigger",
+      "typeVersion": 1,
+      "position": [
+        -800,
+        1100
+      ],
+      "credentials": {
+        "googleSheetsTriggerOAuth2Api": {
+          "id": "OQHH1Skw9eIxRktg",
+          "name": "Google Sheets Trigger account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const TRIGGER = new Set(['New Lead', 'Call', 'Retry', 'Follow-up']);\nconst now = new Date();\nconst e164 = /^\\+[1-9]\\d{6,14}$/;\n\nconst out = [];\nfor (const item of $input.all()) {\n  const j = item.json;\n  const status = (j['Call Status'] || '').trim();\n  if (!TRIGGER.has(status) || status === 'Calling') continue;\n\n  const nextAt = (j['Next Call At'] || '').trim();\n  if (nextAt) {\n    const t = new Date(nextAt);\n    if (!isNaN(t.getTime()) && t > now) continue;\n  }\n\n  const raw = String(j['Phone'] || '').trim();\n  let phone;\n  if (raw.startsWith('+')) {\n    phone = '+' + raw.slice(1).replace(/\\D/g, '');\n  } else {\n    const digits = raw.replace(/\\D/g, '');\n    if (digits.length === 10) phone = '+1' + digits;\n    else if (digits.length === 11 && digits[0] === '1') phone = '+' + digits;\n    else phone = digits ? '+' + digits : '';\n  }\n  if (!e164.test(phone)) continue;\n\n  let trigger_type = 'retry';\n  if (status === 'New Lead') trigger_type = 'new';\n  else if (status === 'Follow-up') trigger_type = 'follow_up';\n  else if (status === 'Call') trigger_type = 'call';\n\n  const attempt = parseInt(j['Call Attempt'] || '0', 10) || 0;\n  out.push({\n    json: {\n      ...j,\n      phone,\n      lead_id: j['Lead ID'],\n      name: (j['name'] || '').trim(),\n      company: (j['company'] || '').trim(),\n      email: (j['email'] || '').trim().toLowerCase(),\n      notes: (j['notes'] || '').trim(),\n      trigger_type,\n      call_attempt: attempt + 1,\n    }\n  });\n}\nreturn out;"
+      },
+      "id": "prepare-lead",
+      "name": "Prepare Lead",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -520,
+        1000
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const j = $input.first().json;\nconst cleaned = String(j.phone || '').replace(/\\D/g, '');\nconst timezoneMap = {\n  '1': 'America/New_York',\n  '44': 'Europe/London',\n  '61': 'Australia/Sydney',\n  '92': 'Asia/Karachi',\n};\nlet timezone = 'America/New_York';\nfor (const code of Object.keys(timezoneMap).sort((a, b) => b.length - a.length)) {\n  if (cleaned.startsWith(code)) { timezone = timezoneMap[code]; break; }\n}\nconst parts = new Intl.DateTimeFormat('en-GB', {\n  timeZone: timezone, hour: 'numeric', hour12: false,\n}).formatToParts(new Date());\nconst localHour = parseInt(parts.find(p => p.type === 'hour').value, 10);\nreturn [{ json: { ...j, timezone, localHour } }];"
+      },
+      "id": "get-timezone",
+      "name": "Get Timezone",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -280,
+        1000
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "version": 2,
+            "leftValue": "",
+            "caseSensitive": true,
+            "typeValidation": "strict"
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "h1",
+              "leftValue": "={{ $json.localHour }}",
+              "rightValue": 8,
+              "operator": {
+                "type": "number",
+                "operation": "gte"
+              }
+            },
+            {
+              "id": "h2",
+              "leftValue": "={{ $json.localHour }}",
+              "rightValue": 17,
+              "operator": {
+                "type": "number",
+                "operation": "lte"
+              }
+            }
+          ]
+        }
+      },
+      "id": "business-hours",
+      "name": "Business Hours?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -40,
+        1000
+      ]
+    },
+    {
+      "parameters": {
+        "amount": 2,
+        "unit": "hours"
+      },
+      "id": "wait-hours",
+      "name": "Wait 2h",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        -40,
+        1220
+      ],
+      "webhookId": "flow-a-wait-hours"
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "1QMFaVb1qLF-ymVsKRPo2goqM4qBSodux7PTWih2xEQQ"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Lead"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Lead ID": "={{ $json.lead_id }}",
+            "Call Status": "Calling",
+            "Call Attempt": "={{ $json.call_attempt }}",
+            "Last Updated": "={{ $now.toISO() }}"
+          },
+          "matchingColumns": [
+            "Lead ID"
+          ]
+        }
+      },
+      "id": "mark-calling",
+      "name": "Mark Calling",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.4,
+      "position": [
+        200,
+        900
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "Xv56FMr5B7fHGuxY",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:8000/call",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"phone\": \"{{ $('Get Timezone').item.json.phone }}\",\n  \"name\": \"{{ $('Get Timezone').item.json.name }}\",\n  \"company\": \"{{ $('Get Timezone').item.json.company }}\",\n  \"email\": \"{{ $('Get Timezone').item.json.email }}\",\n  \"notes\": \"{{ $('Get Timezone').item.json.notes }}\",\n  \"timezone\": \"{{ $('Get Timezone').item.json.timezone }}\",\n  \"lead_id\": \"{{ $('Get Timezone').item.json.lead_id }}\",\n  \"trigger_type\": \"{{ $('Get Timezone').item.json.trigger_type }}\",\n  \"call_attempt\": {{ $('Get Timezone').item.json.call_attempt }}\n}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          },
+          "timeout": 120000
+        }
+      },
+      "id": "sip-dial",
+      "name": "SIP Dial",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        440,
+        900
+      ],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "version": 2,
+            "leftValue": "",
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "ok",
+              "leftValue": "={{ $json.status }}",
+              "rightValue": "dispatched",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ]
+        }
+      },
+      "id": "dial-ok",
+      "name": "Dial OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        680,
+        900
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "1QMFaVb1qLF-ymVsKRPo2goqM4qBSodux7PTWih2xEQQ"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Lead"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Lead ID": "={{ $('Get Timezone').item.json.lead_id }}",
+            "Call Status": "Retry",
+            "notes": "={{ ($('Get Timezone').item.json.notes || '') + ' | dial-failed' }}",
+            "Next Call At": "={{ $now.plus({ hours: 1 }).toISO() }}",
+            "Last Updated": "={{ $now.toISO() }}"
+          },
+          "matchingColumns": [
+            "Lead ID"
+          ]
+        }
+      },
+      "id": "mark-failed",
+      "name": "Mark Dial Failed",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.4,
+      "position": [
+        920,
+        1020
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "Xv56FMr5B7fHGuxY",
+          "name": "Google Sheets account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "New Lead": {
+      "main": [
+        [
+          {
+            "node": "Prepare Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Lead Updated": {
+      "main": [
+        [
+          {
+            "node": "Prepare Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Lead": {
+      "main": [
+        [
+          {
+            "node": "Get Timezone",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Timezone": {
+      "main": [
+        [
+          {
+            "node": "Business Hours?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Business Hours?": {
+      "main": [
+        [
+          {
+            "node": "Mark Calling",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Wait 2h",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait 2h": {
+      "main": [
+        [
+          {
+            "node": "Get Timezone",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Calling": {
+      "main": [
+        [
+          {
+            "node": "SIP Dial",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "SIP Dial": {
+      "main": [
+        [
+          {
+            "node": "Dial OK?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Dial OK?": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Mark Dial Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false,
+  "tags": [
+    "voice-agent",
+    "sip"
+  ]
+}

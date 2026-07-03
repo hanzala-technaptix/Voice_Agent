@@ -1,0 +1,72 @@
+{
+  "name": "Voice Agent — Flow F (Prospecting → CRM)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "prospect",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "webhook",
+      "name": "Webhook: /prospect",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [240, 300],
+      "webhookId": "prospect",
+      "notes": "POST an ICP search or a list of company domains; the prospecting service finds decision-makers, enriches phones, and writes them into the Lead sheet."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Decide which prospecting endpoint to hit based on the payload.\n// If 'domains' present -> /prospect/companies, else -> /prospect/search.\nconst b = $input.first().json.body || $input.first().json;\nconst hasDomains = Array.isArray(b.domains) && b.domains.length > 0 && !b.industries && !b.company_names;\nconst path = hasDomains ? 'companies' : 'search';\nreturn [{ json: { path, payload: b } }];"
+      },
+      "id": "route",
+      "name": "Route",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [480, 300]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=http://localhost:8300/prospect/{{ $json.path }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.payload) }}",
+        "options": {
+          "response": { "response": { "responseFormat": "json", "fullResponse": false } },
+          "timeout": 60000
+        }
+      },
+      "id": "http-prospect",
+      "name": "POST /prospect",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [720, 300],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "content": "## Flow F — Prospecting → CRM\n\nWebhook POST /prospect → prospecting service (port 8300).\n\n**ICP search** body:\n```\n{\n  \"industries\": [\"Manufacturing\"],\n  \"revenues\": [\"10M-50M\"],\n  \"countries\": [\"Pakistan\"],\n  \"seniorities\": [\"cxo\",\"director\"],\n  \"write\": true\n}\n```\n\n**Known companies** body:\n```\n{ \"domains\": [\"acme.com\",\"globex.com\"], \"write\": true }\n```\n\nService finds CEO/CTO/Director, enriches phones, writes 'New Lead' rows → Flow A dials them.\n\nEnv: LUSHA_API_KEY (Premium/Scale), PROSPECT_MAX_WRITE.",
+        "height": 360,
+        "width": 420,
+        "color": 2
+      },
+      "id": "note",
+      "name": "Flow F Notes",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [240, -120]
+    }
+  ],
+  "connections": {
+    "Webhook: /prospect": {
+      "main": [[{ "node": "Route", "type": "main", "index": 0 }]]
+    },
+    "Route": {
+      "main": [[{ "node": "POST /prospect", "type": "main", "index": 0 }]]
+    }
+  },
+  "settings": { "executionOrder": "v1" },
+  "tags": ["voice-agent", "prospecting"]
+}

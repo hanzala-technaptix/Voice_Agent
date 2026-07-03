@@ -1,0 +1,169 @@
+{
+  "name": "Voice Agent \u2014 Flow D (Recovery & Retries)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 30
+            }
+          ]
+        }
+      },
+      "id": "trigger-schedule",
+      "name": "Every 30 min",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        240,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "1QMFaVb1qLF-ymVsKRPo2goqM4qBSodux7PTWih2xEQQ",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Lead",
+          "mode": "name"
+        },
+        "options": {
+          "returnAllMatches": true
+        }
+      },
+      "id": "sheets-read",
+      "name": "Get All Rows",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.4,
+      "position": [
+        480,
+        400
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "Xv56FMr5B7fHGuxY",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const now = new Date();\nconst out = [];\nfor (const item of $input.all()) {\n  const j = item.json;\n  const status = (j['Call Status'] || '').trim();\n  const outcome = (j['Call Outcome'] || '').trim().toLowerCase();\n  const attempt = parseInt(j['Call Attempt'] || '0', 10) || 0;\n  const lastUp = (j['Last Updated'] || '').trim();\n  const leadId = j['Lead ID'];\n  if (!leadId) continue;\n\n  // Stuck Calling > 15 min\n  if (status === 'Calling' && lastUp) {\n    const t = new Date(lastUp);\n    if (!isNaN(t.getTime()) && (now - t) > 15 * 60 * 1000) {\n      out.push({ json: { lead_id: leadId, action: 'stuck_calling', new_status: 'Retry', note: 'auto-recovery: stuck Calling' } });\n      continue;\n    }\n  }\n\n  // No answer \u2192 retry if attempts < 3\n  if (status === 'No Answer' && outcome === 'no_answer' && attempt < 3) {\n    const next = new Date(now.getTime() + 4 * 60 * 60 * 1000).toISOString();\n    out.push({ json: { lead_id: leadId, action: 'retry_no_answer', new_status: 'Retry', next_call_at: next, note: 'auto-retry after no answer' } });\n    continue;\n  }\n\n  // Max attempts\n  if (status === 'No Answer' && attempt >= 3) {\n    out.push({ json: { lead_id: leadId, action: 'max_attempts', new_status: 'Declined', note: 'max call attempts reached' } });\n  }\n}\nreturn out;"
+      },
+      "id": "detect-recovery",
+      "name": "Detect Recovery Actions",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        700,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "value": "1QMFaVb1qLF-ymVsKRPo2goqM4qBSodux7PTWih2xEQQ",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Lead",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Lead ID": "={{ $json.lead_id }}",
+            "Call Status": "={{ $json.new_status }}",
+            "notes": "={{ $json.note }}",
+            "Next Call At": "={{ $json.next_call_at || '' }}",
+            "Last Updated": "={{ $now.toISO() }}"
+          },
+          "matchingColumns": [
+            "Lead ID"
+          ]
+        }
+      },
+      "id": "sheets-apply",
+      "name": "Apply Recovery",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.4,
+      "position": [
+        920,
+        400
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "Xv56FMr5B7fHGuxY",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "content": "## Flow D \u2014 Recovery\n\nEvery 30 min:\n- Calling > 15 min \u2192 Retry\n- No Answer + attempts < 3 \u2192 Retry (+4h)\n- No Answer + attempts >= 3 \u2192 Declined",
+        "height": 160,
+        "width": 380,
+        "color": 3
+      },
+      "id": "note",
+      "name": "Flow D Notes",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        240,
+        20
+      ]
+    }
+  ],
+  "connections": {
+    "Every 30 min": {
+      "main": [
+        [
+          {
+            "node": "Get All Rows",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get All Rows": {
+      "main": [
+        [
+          {
+            "node": "Detect Recovery Actions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Detect Recovery Actions": {
+      "main": [
+        [
+          {
+            "node": "Apply Recovery",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "tags": [
+    "voice-agent",
+    "sip"
+  ]
+}

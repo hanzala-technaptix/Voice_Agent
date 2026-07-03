@@ -1,0 +1,1023 @@
+{
+  "name": "My workflow",
+  "nodes": [
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            }
+          ]
+        },
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "1QMFaVb1qLF-ymVsKRPo2goqM4qBSodux7PTWih2xEQQ"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Lead"
+        },
+        "event": "rowAdded",
+        "options": {}
+      },
+      "id": "trigger-new-lead",
+      "name": "New Lead",
+      "type": "n8n-nodes-base.googleSheetsTrigger",
+      "typeVersion": 1,
+      "position": [
+        -800,
+        1500
+      ],
+      "credentials": {
+        "googleSheetsTriggerOAuth2Api": {
+          "id": "OQHH1Skw9eIxRktg",
+          "name": "Google Sheets Trigger account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "pollTimes": {
+          "item": [
+            {
+              "mode": "everyMinute"
+            }
+          ]
+        },
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "1QMFaVb1qLF-ymVsKRPo2goqM4qBSodux7PTWih2xEQQ"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Lead"
+        },
+        "event": "rowUpdate",
+        "options": {}
+      },
+      "id": "trigger-row-update",
+      "name": "Lead Updated",
+      "type": "n8n-nodes-base.googleSheetsTrigger",
+      "typeVersion": 1,
+      "position": [
+        -800,
+        1700
+      ],
+      "credentials": {
+        "googleSheetsTriggerOAuth2Api": {
+          "id": "OQHH1Skw9eIxRktg",
+          "name": "Google Sheets Trigger account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const TRIGGER = new Set(['New Lead', 'Call', 'Retry', 'Follow-up']);\nconst now = new Date();\nconst e164 = /^\\+[1-9]\\d{6,14}$/;\n\nconst out = [];\nfor (const item of $input.all()) {\n  const j = item.json;\n  const status = (j['Call Status'] || '').trim();\n  if (!TRIGGER.has(status) || status === 'Calling') continue;\n\n  const nextAt = (j['Next Call At'] || '').trim();\n  if (nextAt) {\n    const t = new Date(nextAt);\n    if (!isNaN(t.getTime()) && t > now) continue;\n  }\n\n  const raw = String(j['Phone'] || '').trim();\n  let phone;\n  if (raw.startsWith('+')) {\n    phone = '+' + raw.slice(1).replace(/\\D/g, '');\n  } else {\n    const digits = raw.replace(/\\D/g, '');\n    if (digits.length === 10) phone = '+1' + digits;\n    else if (digits.length === 11 && digits[0] === '1') phone = '+' + digits;\n    else phone = digits ? '+' + digits : '';\n  }\n  if (!e164.test(phone)) continue;\n\n  let trigger_type = 'retry';\n  if (status === 'New Lead') trigger_type = 'new';\n  else if (status === 'Follow-up') trigger_type = 'follow_up';\n  else if (status === 'Call') trigger_type = 'call';\n\n  const attempt = parseInt(j['Call Attempt'] || '0', 10) || 0;\n  out.push({\n    json: {\n      ...j,\n      phone,\n      lead_id: j['Lead ID'],\n      name: (j['name'] || '').trim(),\n      company: (j['company'] || '').trim(),\n      email: (j['email'] || '').trim().toLowerCase(),\n      notes: (j['notes'] || '').trim(),\n      trigger_type,\n      call_attempt: attempt + 1,\n    }\n  });\n}\nreturn out;"
+      },
+      "id": "prepare-lead",
+      "name": "Prepare Lead",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -520,
+        1600
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const j = $input.first().json;\nconst cleaned = String(j.phone || '').replace(/\\D/g, '');\nconst timezoneMap = {\n  '1': 'America/New_York',\n  '44': 'Europe/London',\n  '61': 'Australia/Sydney',\n  '92': 'Asia/Karachi',\n};\nlet timezone = 'America/New_York';\nfor (const code of Object.keys(timezoneMap).sort((a, b) => b.length - a.length)) {\n  if (cleaned.startsWith(code)) { timezone = timezoneMap[code]; break; }\n}\nconst parts = new Intl.DateTimeFormat('en-GB', {\n  timeZone: timezone, hour: 'numeric', hour12: false,\n}).formatToParts(new Date());\nconst localHour = parseInt(parts.find(p => p.type === 'hour').value, 10);\nreturn [{ json: { ...j, timezone, localHour } }];"
+      },
+      "id": "get-timezone",
+      "name": "Get Timezone",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -280,
+        1600
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "version": 2,
+            "leftValue": "",
+            "caseSensitive": true,
+            "typeValidation": "strict"
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "h1",
+              "leftValue": "={{ $json.localHour }}",
+              "rightValue": 8,
+              "operator": {
+                "type": "number",
+                "operation": "gte"
+              }
+            },
+            {
+              "id": "h2",
+              "leftValue": "={{ $json.localHour }}",
+              "rightValue": 17,
+              "operator": {
+                "type": "number",
+                "operation": "lte"
+              }
+            }
+          ]
+        }
+      },
+      "id": "business-hours",
+      "name": "Business Hours?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -40,
+        1600
+      ]
+    },
+    {
+      "parameters": {
+        "amount": 2,
+        "unit": "hours"
+      },
+      "id": "wait-hours",
+      "name": "Wait 2h",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        -40,
+        1820
+      ],
+      "webhookId": "flow-a-wait-hours"
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "1QMFaVb1qLF-ymVsKRPo2goqM4qBSodux7PTWih2xEQQ"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Lead"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Lead ID": "={{ $json.lead_id }}",
+            "Call Status": "Calling",
+            "Call Attempt": "={{ $json.call_attempt }}",
+            "Last Updated": "={{ $now.toISO() }}"
+          },
+          "matchingColumns": [
+            "Lead ID"
+          ]
+        }
+      },
+      "id": "mark-calling",
+      "name": "Mark Calling",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.4,
+      "position": [
+        200,
+        1500
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "Xv56FMr5B7fHGuxY",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:8000/call",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"phone\": \"{{ $('Get Timezone').item.json.phone }}\",\n  \"name\": \"{{ $('Get Timezone').item.json.name }}\",\n  \"company\": \"{{ $('Get Timezone').item.json.company }}\",\n  \"email\": \"{{ $('Get Timezone').item.json.email }}\",\n  \"notes\": \"{{ $('Get Timezone').item.json.notes }}\",\n  \"timezone\": \"{{ $('Get Timezone').item.json.timezone }}\",\n  \"lead_id\": \"{{ $('Get Timezone').item.json.lead_id }}\",\n  \"trigger_type\": \"{{ $('Get Timezone').item.json.trigger_type }}\",\n  \"call_attempt\": {{ $('Get Timezone').item.json.call_attempt }}\n}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          },
+          "timeout": 120000
+        }
+      },
+      "id": "sip-dial",
+      "name": "SIP Dial",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        440,
+        1500
+      ],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "version": 2,
+            "leftValue": "",
+            "caseSensitive": true,
+            "typeValidation": "loose"
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "ok",
+              "leftValue": "={{ $json.status }}",
+              "rightValue": "dispatched",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ]
+        }
+      },
+      "id": "dial-ok",
+      "name": "Dial OK?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        680,
+        1500
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "1QMFaVb1qLF-ymVsKRPo2goqM4qBSodux7PTWih2xEQQ"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Lead"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Lead ID": "={{ $('Get Timezone').item.json.lead_id }}",
+            "Call Status": "Retry",
+            "notes": "={{ ($('Get Timezone').item.json.notes || '') + ' | dial-failed' }}",
+            "Next Call At": "={{ $now.plus({ hours: 1 }).toISO() }}",
+            "Last Updated": "={{ $now.toISO() }}"
+          },
+          "matchingColumns": [
+            "Lead ID"
+          ]
+        }
+      },
+      "id": "mark-failed",
+      "name": "Mark Dial Failed",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.4,
+      "position": [
+        920,
+        1620
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "Xv56FMr5B7fHGuxY",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "voice-results",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "webhook",
+      "name": "Webhook: /voice-results",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        240,
+        400
+      ],
+      "webhookId": "voice-results"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={ \"ok\": true }",
+        "options": {}
+      },
+      "id": "respond",
+      "name": "Respond 200 OK",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        480,
+        200
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const b = $input.item.json.body || $input.item.json;\nconst lead = b.lead || {};\nconst booking = b.booking || {};\nconst outcome = (b.outcome || 'no_answer').toString().toLowerCase();\n\nconst statusMap = {\n  booked: 'Booked',\n  declined: 'Declined',\n  callback: 'Callback Requested',\n  voicemail: 'Voicemail',\n  no_answer: 'No Answer',\n  incomplete: 'Hung up',\n};\n\nlet transcriptText = (b.transcript_text || '').toString();\nif (!transcriptText && b.transcript) {\n  const items = b.transcript.items || b.transcript.messages || [];\n  transcriptText = items.map(t => {\n    const role = (t.role || t.type || '').toLowerCase();\n    const label = role === 'user' ? 'Prospect' : 'Agent';\n    let content = t.content || t.text || '';\n    if (Array.isArray(content)) content = content.map(c => c.text || c).join(' ');\n    return content ? `${label}: ${content}` : '';\n  }).filter(Boolean).join('\\n');\n}\n\nconst interested = (b.interested === true || outcome === 'booked') ? 'true' : 'false';\nconst followUp = (b.follow_up_required === true || outcome === 'callback') ? 'true' : 'false';\n\nconst meetingNote = booking.start_label ? ` | meeting: ${booking.start_label}` : '';\nconst meetLink = booking.meet_link ? ` | ${booking.meet_link}` : '';\n\nreturn [{\n  json: {\n    lead_id: lead.lead_id || '',\n    phone: lead.phone || '',\n    name: lead.name || '',\n    email: lead.email || '',\n    call_status: statusMap[outcome] || 'No Answer',\n    call_outcome: outcome,\n    summary: b.summary || '',\n    transcript_text: transcriptText,\n    notes: (b.summary || '') + meetingNote + meetLink,\n    interested,\n    follow_up_required: followUp,\n    duration_sec: b.duration_sec || 0,\n    meeting_time: booking.start_label || '',\n    meet_link: booking.meet_link || '',\n    booking_id: booking.booking_id || '',\n    last_updated: new Date().toISOString(),\n  }\n}];"
+      },
+      "id": "normalize-payload",
+      "name": "Parse Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        480,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "value": "1QMFaVb1qLF-ymVsKRPo2goqM4qBSodux7PTWih2xEQQ",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Lead",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Lead ID": "={{ $json.lead_id }}",
+            "Call Status": "={{ $json.call_status }}",
+            "Call Outcome": "={{ $json.call_outcome }}",
+            "notes": "={{ $json.notes }}",
+            "Transcript": "={{ $json.transcript_text }}",
+            "Last Updated": "={{ $json.last_updated }}"
+          },
+          "matchingColumns": [
+            "Lead ID"
+          ]
+        }
+      },
+      "id": "sheets-update",
+      "name": "Update CRM Row",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.4,
+      "position": [
+        720,
+        400
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "Xv56FMr5B7fHGuxY",
+          "name": "Google Sheets account"
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "is-booked",
+              "leftValue": "={{ $json.call_outcome }}",
+              "rightValue": "booked",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "if-booked",
+      "name": "Booked?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        960,
+        400
+      ]
+    },
+    {
+      "parameters": {
+        "sendTo": "hanzalatechnaptix@gmail.com",
+        "subject": "Voice agent booked: {{ $json.name }} @ {{ $json.meeting_time }}",
+        "emailType": "text",
+        "message": "Lead: {{ $json.name }}\nPhone: {{ $json.phone }}\nEmail: {{ $json.email }}\n\nMeeting: {{ $json.meeting_time }}\nMeet link: {{ $json.meet_link }}\n\nSummary:\n{{ $json.summary }}\n\nTranscript:\n{{ $json.transcript_text }}",
+        "options": {}
+      },
+      "id": "gmail-internal",
+      "name": "Notify Owner",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        1200,
+        300
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "OOkRCfYnEsA8XEqg",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "id": "is-callback",
+              "leftValue": "={{ $json.call_outcome }}",
+              "rightValue": "callback",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "if-callback",
+      "name": "Callback?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [
+        1200,
+        500
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "value": "1QMFaVb1qLF-ymVsKRPo2goqM4qBSodux7PTWih2xEQQ",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Lead",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Lead ID": "={{ $json.lead_id }}",
+            "Call Status": "Follow-up",
+            "Next Call At": "={{ $now.plus({ days: 1 }).toISO() }}"
+          },
+          "matchingColumns": [
+            "Lead ID"
+          ]
+        }
+      },
+      "id": "sheets-schedule-callback",
+      "name": "Schedule Callback",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.4,
+      "position": [
+        1440,
+        500
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "Xv56FMr5B7fHGuxY",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "content": "## Flow B \u2014 Results Receiver\n\nWebhook POST /voice-results \u2190 agent.py N8N_RESULTS_WEBHOOK\n\nWrites: Call Status, Outcome, Notes, Transcript (full dialogue), Last Updated\n\nEnv: LEAD_SHEET_ID, OWNER_EMAIL",
+        "height": 200,
+        "width": 420,
+        "color": 4
+      },
+      "id": "note",
+      "name": "Flow B Notes",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        240,
+        20
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "lead-intake",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "webhook-c",
+      "name": "Webhook: /lead-intake",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        1940,
+        1000
+      ],
+      "webhookId": "lead-intake",
+      "notes": "Public webhook to receive leads from any source: web form, Apollo Zapier, manual paste, etc."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:8100/leads",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"name\": \"{{ $json.body.name || $json.name }}\",\n  \"phone\": \"{{ $json.body.phone || $json.phone }}\",\n  \"email\": \"{{ $json.body.email || $json.email }}\",\n  \"company\": \"{{ $json.body.company || $json.company }}\",\n  \"source\": \"{{ $json.body.source || $json.source || 'webhook' }}\",\n  \"notes\": \"{{ $json.body.notes || $json.notes || '' }}\"\n}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json",
+              "fullResponse": false
+            }
+          },
+          "timeout": 15000,
+          "retry": {
+            "retry": {
+              "maxRetries": 2,
+              "waitBetweenRetries": 2000
+            }
+          }
+        }
+      },
+      "id": "http-collector",
+      "name": "POST /leads",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2180,
+        1000
+      ],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "content": "## Flow C \u2014 Lead Intake (optional)\n\nThin webhook \u2192 calls the lead_collector service. Use it if you want to receive leads via webhook (form, Apollo + Zapier, etc.).\n\nFor a CSV / Apollo export, skip this and run:\n`python lead_collector.py import-csv leads.csv`\n\n**Env vars:**\n- `LEAD_COLLECTOR_URL` \u2014 e.g. `http://localhost:8100`",
+        "height": 220,
+        "width": 420,
+        "color": 6
+      },
+      "id": "note-c",
+      "name": "Flow C Notes",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1940,
+        620
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 30
+            }
+          ]
+        }
+      },
+      "id": "trigger-schedule",
+      "name": "Every 30 min",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        1940,
+        1600
+      ]
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "1QMFaVb1qLF-ymVsKRPo2goqM4qBSodux7PTWih2xEQQ",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Lead",
+          "mode": "name"
+        },
+        "options": {
+          "returnAllMatches": true
+        }
+      },
+      "id": "sheets-read",
+      "name": "Get All Rows",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.4,
+      "position": [
+        2180,
+        1600
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "Xv56FMr5B7fHGuxY",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const now = new Date();\nconst out = [];\nfor (const item of $input.all()) {\n  const j = item.json;\n  const status = (j['Call Status'] || '').trim();\n  const outcome = (j['Call Outcome'] || '').trim().toLowerCase();\n  const attempt = parseInt(j['Call Attempt'] || '0', 10) || 0;\n  const lastUp = (j['Last Updated'] || '').trim();\n  const leadId = j['Lead ID'];\n  if (!leadId) continue;\n\n  // Stuck Calling > 15 min\n  if (status === 'Calling' && lastUp) {\n    const t = new Date(lastUp);\n    if (!isNaN(t.getTime()) && (now - t) > 15 * 60 * 1000) {\n      out.push({ json: { lead_id: leadId, action: 'stuck_calling', new_status: 'Retry', note: 'auto-recovery: stuck Calling' } });\n      continue;\n    }\n  }\n\n  // No answer \u2192 retry if attempts < 3\n  if (status === 'No Answer' && outcome === 'no_answer' && attempt < 3) {\n    const next = new Date(now.getTime() + 4 * 60 * 60 * 1000).toISOString();\n    out.push({ json: { lead_id: leadId, action: 'retry_no_answer', new_status: 'Retry', next_call_at: next, note: 'auto-retry after no answer' } });\n    continue;\n  }\n\n  // Max attempts\n  if (status === 'No Answer' && attempt >= 3) {\n    out.push({ json: { lead_id: leadId, action: 'max_attempts', new_status: 'Declined', note: 'max call attempts reached' } });\n  }\n}\nreturn out;"
+      },
+      "id": "detect-recovery",
+      "name": "Detect Recovery Actions",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2400,
+        1600
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "value": "1QMFaVb1qLF-ymVsKRPo2goqM4qBSodux7PTWih2xEQQ",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "Lead",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Lead ID": "={{ $json.lead_id }}",
+            "Call Status": "={{ $json.new_status }}",
+            "notes": "={{ $json.note }}",
+            "Next Call At": "={{ $json.next_call_at || '' }}",
+            "Last Updated": "={{ $now.toISO() }}"
+          },
+          "matchingColumns": [
+            "Lead ID"
+          ]
+        }
+      },
+      "id": "sheets-apply",
+      "name": "Apply Recovery",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.4,
+      "position": [
+        2620,
+        1600
+      ],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "Xv56FMr5B7fHGuxY",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "content": "## Flow D \u2014 Recovery\n\nEvery 30 min:\n- Calling > 15 min \u2192 Retry\n- No Answer + attempts < 3 \u2192 Retry (+4h)\n- No Answer + attempts >= 3 \u2192 Declined",
+        "height": 160,
+        "width": 380,
+        "color": 3
+      },
+      "id": "note-d",
+      "name": "Flow D Notes",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1940,
+        1220
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "acquire-lead",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "webhook-e",
+      "name": "Webhook: /acquire-lead",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        1940,
+        2060
+      ],
+      "webhookId": "acquire-lead",
+      "notes": "Public webhook to receive raw acquisition leads, enrich/score them, and ingest qualified leads into the sheet."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "http://localhost:8200/acquire",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={\n  \"name\": \"{{ $json.body.name || $json.name || $json.fullName || $json.contact_name }}\",\n  \"phone\": \"{{ $json.body.phone || $json.phone || $json.mobile || $json.telephone }}\",\n  \"company\": \"{{ $json.body.company || $json.company || $json.organization }}\",\n  \"email\": \"{{ $json.body.email || $json.email || $json.email_address }}\",\n  \"title\": \"{{ $json.body.title || $json.title || $json.job_title }}\",\n  \"linkedin_url\": \"{{ $json.body.linkedin_url || $json.body.linkedin || $json.body.profile_url || $json.linkedin_url || $json.linkedin }}\",\n  \"campaign\": \"{{ $json.body.campaign || $json.body.utm_campaign || $json.utm_campaign || $json.campaign }}\",\n  \"timezone\": \"{{ $json.body.timezone || $json.timezone || \\\"\\\" }}\",\n  \"source\": \"{{ $json.body.source || $json.source || $json.utm_source || \\\"lead_acquisition\\\" }}\",\n  \"notes\": \"{{ $json.body.notes || $json.notes || \\\"\\\" }}\"\n}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "json",
+              "fullResponse": false
+            }
+          },
+          "timeout": 15000
+        }
+      },
+      "id": "http-acquire",
+      "name": "POST /acquire",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2220,
+        2060
+      ],
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "content": "## Flow E \u2014 Lead Acquisition\n\nThis flow accepts incoming acquisition leads via webhook, posts them to the local acquisition service, and allows the service to enrich and auto-ingest qualified records into the Google Sheet CRM.\n\nUse this when you want to collect leads from web forms, Zapier, Apollo, or other partner systems without touching the outbound voice flow.\n\nEnv vars:\n- `LEAD_ACQUISITION_URL` \u2014 e.g. `http://localhost:8200`\n- `LEAD_COLLECTOR_URL` \u2014 e.g. `http://localhost:8100`\n- `LUSHA_API_KEY` \u2014 optional for enrichment\n- `ACQUISITION_AUTO_INGEST_MIN_SCORE` \u2014 numeric threshold, default `65`\n\nPayload example:\n{\n  \"name\": \"Jane Doe\",\n  \"phone\": \"+14155551234\",\n  \"email\": \"jane@example.com\",\n  \"company\": \"Acme Inc.\",\n  \"title\": \"VP Sales\",\n  \"linkedin_url\": \"https://www.linkedin.com/in/janedoe\",\n  \"source\": \"webhook\"\n}\n",
+        "height": 260,
+        "width": 420,
+        "color": 5
+      },
+      "id": "note-e",
+      "name": "Flow E Notes",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        1940,
+        1840
+      ]
+    }
+  ],
+  "connections": {
+    "New Lead": {
+      "main": [
+        [
+          {
+            "node": "Prepare Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Lead Updated": {
+      "main": [
+        [
+          {
+            "node": "Prepare Lead",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Lead": {
+      "main": [
+        [
+          {
+            "node": "Get Timezone",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Timezone": {
+      "main": [
+        [
+          {
+            "node": "Business Hours?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Business Hours?": {
+      "main": [
+        [
+          {
+            "node": "Mark Calling",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Wait 2h",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait 2h": {
+      "main": [
+        [
+          {
+            "node": "Get Timezone",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Calling": {
+      "main": [
+        [
+          {
+            "node": "SIP Dial",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "SIP Dial": {
+      "main": [
+        [
+          {
+            "node": "Dial OK?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Dial OK?": {
+      "main": [
+        [],
+        [
+          {
+            "node": "Mark Dial Failed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook: /voice-results": {
+      "main": [
+        [
+          {
+            "node": "Respond 200 OK",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Parse Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse Payload": {
+      "main": [
+        [
+          {
+            "node": "Update CRM Row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update CRM Row": {
+      "main": [
+        [
+          {
+            "node": "Booked?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Booked?": {
+      "main": [
+        [
+          {
+            "node": "Notify Owner",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Callback?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Callback?": {
+      "main": [
+        [
+          {
+            "node": "Schedule Callback",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Webhook: /lead-intake": {
+      "main": [
+        [
+          {
+            "node": "POST /leads",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Every 30 min": {
+      "main": [
+        [
+          {
+            "node": "Get All Rows",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get All Rows": {
+      "main": [
+        [
+          {
+            "node": "Detect Recovery Actions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Detect Recovery Actions": {
+      "main": [
+        [
+          {
+            "node": "Apply Recovery",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook: /acquire-lead": {
+      "main": [
+        [
+          {
+            "node": "POST /acquire",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false,
+  "tags": [
+    "voice-agent"
+  ]
+}

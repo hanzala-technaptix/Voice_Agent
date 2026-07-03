@@ -1,0 +1,4 @@
+name,phone,company,email,source,notes
+John Demo,+15551234567,Acme Manufacturing,john@acme.test,csv-demo,5 plants in the Midwest
+Sara Test,(415) 555-9876,Westgate Logistics,sara@westgate.test,csv-demo,interested in PPE detection
+Hassan Khan,+923001234567,Karachi Textile Co,hassan@kt.test,csv-demo,referred by trade show
