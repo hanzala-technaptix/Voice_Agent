@@ -392,7 +392,7 @@ Deep tech/pricing -> specialist on the discovery call. Site: {WEBSITE} | {EMAIL}
 """
 
 
-# ----------------------------------------------------------------------- #
+# testing purpose  ----------------------------------------------------------------------- #
 #  Manual smoke test:  python outbound_prompt.py                          #
 # ----------------------------------------------------------------------- #
 if __name__ == "__main__":
