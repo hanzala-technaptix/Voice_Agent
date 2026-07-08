@@ -15,7 +15,7 @@ Google Sheet (Lead)
   n8n Flow A ──POST /call──► dispatch.py ──SIP──► prospect's phone rings
        │                            │
        │                            ▼
-       │                      agent.py (GPT-4o-mini + Gladia STT)
+       │                      agent.py (Groq LLM + Deepgram STT/TTS)
        │                            │
        │                     Cal.com booking (mid-call)
        │                            │
@@ -55,7 +55,7 @@ Google Sheet (Lead)
 ## Prerequisites
 
 - LiveKit Cloud project + **SIP outbound trunk** (Twilio)
-- Gladia, OpenAI, Cal.com API keys
+- Deepgram, Groq, OpenAI, Cal.com API keys
 - Google Sheet (tab `Lead`) + service account JSON
 - n8n (self-hosted or cloud)
 - Python 3.11+

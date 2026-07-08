@@ -16,12 +16,12 @@ All runtime configuration lives in .env — see config.py for the full variable 
 import asyncio
 import json
 import logging
+import os
 import re as _re
 import time
 from datetime import datetime, timezone
 
 import httpx
-from livekit.plugins import telnyx as telnyx_plugin
 
 from livekit import api, rtc
 from livekit.agents import (
@@ -31,6 +31,7 @@ from livekit.agents import (
     BackgroundAudioPlayer,
     BuiltinAudioClip,
     JobContext,
+    JobProcess,
     MetricsCollectedEvent,
     RunContext,
     TurnHandlingOptions,
@@ -41,9 +42,9 @@ from livekit.agents import (
     llm,
     metrics,
 )
-# from livekit.plugins import deepgram, openai, silero
-from livekit.plugins import gladia, openai, silero
-from livekit.plugins import deepgram  # preserved for Deepgram TTS path
+from livekit.agents.worker import ServerEnvOption
+from livekit.plugins import openai, silero
+from livekit.plugins import deepgram
 from livekit.plugins import groq
 from config import ConfigurationError, settings
 from prompts import CALLER_NAME, COMPANY, build_instructions
@@ -132,29 +133,31 @@ def _build_llm():
     )
 
 
-def _build_stt():
-    """Build Gladia STT — all params env-driven via config.settings.
-
-    Param mapping from .env → Gladia:
-      STT_LANGUAGE              → languages (BCP-47 base tag, e.g. "en-US" → ["en"])
-      STT_MODEL                 → model     (must be a valid GladiaModels value)
-      STT_INTERIM_RESULTS       → interim_results
-      STT_ENDPOINTING_MS        → endpointing (ms → seconds)
-      STT_MAX_DURATION_NO_EOS_S → maximum_duration_without_endpointing
-      STT_REGION                → region    ("us-west" | "eu-west")
-      STT_AUDIO_ENHANCER        → pre_processing_audio_enhancer (bool)
-      STT_SPEECH_THRESHOLD      → pre_processing_speech_threshold (0.0–1.0)
-
-    Notes:
-    - STT_MODEL: if a legacy Deepgram value (e.g. "nova-3") is present in .env
-      it falls back to "solaria-1" with a warning rather than crashing.
-    - STT_ENDPOINTING_MS=50 → 0.05s (Gladia default — commit very fast, may
-      over-segment). 300ms → 0.300s (recommended starting point for voice agents).
-    - maximum_duration_without_endpointing caps the worst-case turn wait even
-      when Gladia never fires its silence endpointing (e.g. on noisy lines).
-    - energy_filter=False (default) — Gladia's own VAD handles this; enabling
-      the plugin-level filter adds a second gate and can delay interim results.
+def _build_groq_warmup_client():
+    """Build a standalone, throwaway Groq LLM client used ONLY to pre-warm
+    the DNS/TCP/TLS connection to Groq before the first real completion
+    request. Deliberately separate from _build_llm(): this helper never
+    creates OpenAI, never creates a FallbackAdapter, and its return value is
+    never passed to AgentSession — its only job is connection warmup, closed
+    again right after. Returns None when LLM_BACKEND isn't "groq" (primary
+    isn't Groq, so there's nothing to warm).
     """
+    cfg = settings
+    if cfg.llm_backend != "groq":
+        return None
+    assert cfg.llm_model_groq is not None
+    kwargs: dict = {
+        "model": cfg.llm_model_groq,
+        "temperature": cfg.llm_temperature,
+        "parallel_tool_calls": cfg.llm_parallel_tool_calls,
+    }
+    if cfg.groq_reasoning_effort is not None:
+        kwargs["reasoning_effort"] = cfg.groq_reasoning_effort
+    return groq.LLM(**kwargs)
+
+
+def _build_stt():
+    """Build Deepgram STT — all params env-driven via config.settings."""
     cfg = settings
     if cfg.stt_backend == "deepgram":
         logger.info("STT: Deepgram %s (%s)", cfg.stt_model, cfg.stt_language)
@@ -168,56 +171,12 @@ def _build_stt():
             filler_words=cfg.stt_filler_words,
             punctuate=cfg.stt_punctuate,
         )
-    if cfg.stt_backend != "gladia":
-        raise ConfigurationError(f"Unsupported STT_BACKEND: {cfg.stt_backend}")
-
-    # Map STT_LANGUAGE ("en-US" or "en") → Gladia BCP-47 base tag list.
-    language_tag = cfg.stt_language.split("-")[0].lower()
-
-    # Validate STT_MODEL against known Gladia models; warn + fallback if stale.
-    _GLADIA_MODELS = {"solaria-1", "solaria-2"}
-    model = cfg.stt_model if cfg.stt_model in _GLADIA_MODELS else "solaria-1"
-    if cfg.stt_model not in _GLADIA_MODELS:
-        logger.warning(
-            "STT_MODEL=%r is not a valid Gladia model — falling back to 'solaria-1'. "
-            "Update STT_MODEL in .env to remove this warning.",
-            cfg.stt_model,
-        )
-
-    # STT_ENDPOINTING_MS (int) → Gladia endpointing (float seconds).
-    endpointing_sec = round(cfg.stt_endpointing_ms / 1000, 3)
-
-    logger.info(
-        "STT: Gladia model=%s languages=[%s] endpointing=%.3fs "
-        "max_duration_no_eos=%.1fs interim=%s region=%s audio_enhancer=%s",
-        model,
-        language_tag,
-        endpointing_sec,
-        cfg.stt_max_duration_no_eos_sec,
-        cfg.stt_interim_results,
-        cfg.stt_region,
-        cfg.stt_audio_enhancer,
-    )
-    return gladia.STT(
-        model=model,
-        languages=[language_tag],
-        endpointing=endpointing_sec,
-        maximum_duration_without_endpointing=cfg.stt_max_duration_no_eos_sec,
-        interim_results=cfg.stt_interim_results,
-        region=cfg.stt_region,
-        pre_processing_audio_enhancer=cfg.stt_audio_enhancer,
-        pre_processing_speech_threshold=cfg.stt_speech_threshold,
-        energy_filter=False,  # let Gladia's server-side VAD handle this
-    )
+    raise ConfigurationError(f"Unsupported STT_BACKEND: {cfg.stt_backend}")
 
 
 def _build_tts():
     """Build TTS from .env — no silent provider fallback."""
     cfg = settings
-    if cfg.tts_backend == "telnyx":
-        assert cfg.telnyx_tts_voice is not None
-        logger.info("TTS: Telnyx %s", cfg.telnyx_tts_voice)
-        return telnyx_plugin.TTS(voice=cfg.telnyx_tts_voice)
     if cfg.tts_backend == "deepgram":
         assert cfg.tts_voice is not None
         logger.info("TTS: Deepgram %s", cfg.tts_voice)
@@ -242,6 +201,15 @@ class OutboundSalesAgent(Agent):
             "summary": "",
             "interested": None,
             "follow_up_required": False,
+            # Follow-up intro email (separate from Cal.com booking invite).
+            # Populated only by capture_followup_email() when the prospect
+            # is busy / requests information. n8n Flow B (post-call) reads
+            # these keys to decide whether to send the intro email. Booking
+            # short-circuits: if status=="booked", these stay at defaults
+            # and no intro email fires (Cal.com already emailed the invite).
+            "followup_requested": False,
+            "followup_email": None,
+            "followup_type": None,  # "busy" | "info_request"
         }
         self.call_started_at: datetime | None = None
         self.spoke_with_human = False
@@ -350,6 +318,85 @@ class OutboundSalesAgent(Agent):
             f"'Perfect, you're all set for {booking['start_label']}. "
             "You'll get a calendar invite with a Google Meet link in your inbox shortly. "
             "Really appreciate your time — have a great day!' "
+            "Then invoke end_call."
+        )
+
+    # ------------------------------------------------------------------
+    # Follow-up intro email (separate from Cal.com booking invite)
+    # ------------------------------------------------------------------
+    # This tool ONLY stores a confirmed email + intent on self.outcome.
+    # No network I/O. No sending. n8n Flow B (post-call) is the sender —
+    # it already receives the outcome payload via report_results, so the
+    # send happens async, after end_call, off the voice path.
+    #
+    # Guardrails:
+    #   - Refuses if the call already booked → Cal.com sent the invite.
+    #   - Validates email format with a strict-enough regex before storing.
+    #   - Returns a private [TOOL RESULT] telling the model what to say
+    #     next in each branch (stored / bad-format / already-booked).
+    _EMAIL_RE = _re.compile(
+        r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$"
+    )
+
+    @function_tool()
+    async def capture_followup_email(
+        self,
+        context: RunContext,
+        email: str,
+        reason: str,
+    ) -> str:
+        """Store a confirmed email address for a post-call follow-up intro
+        (used ONLY when the prospect is busy or asks for information —
+        NEVER for a meeting booking, which is handled by book_meeting).
+
+        Args:
+            email: The prospect's confirmed email address (must be validated
+                and read back to them BEFORE calling this tool).
+            reason: Why we're sending it — must be either "busy" (they
+                couldn't talk) or "info_request" (they asked for information).
+        """
+        # Never send a follow-up if we already booked — Cal.com emailed them.
+        if self.outcome.get("status") == "booked":
+            logger.info("followup email: refused (already booked)")
+            return (
+                "[TOOL RESULT — do not read aloud] Follow-up email is not "
+                "needed because a meeting was already booked (the calendar "
+                "invite covers the introduction). Continue the current wrap-up "
+                "and invoke end_call as planned."
+            )
+
+        clean = (email or "").strip().strip(".").strip()
+        if not clean or not self._EMAIL_RE.match(clean):
+            logger.info("followup email: invalid format %r", clean[:80])
+            return (
+                "[TOOL RESULT — do not read aloud] The email address didn't "
+                "parse cleanly. Politely ask them to spell it once more, "
+                "letter by letter, then re-invoke capture_followup_email "
+                "with the corrected address. If it fails a second time, "
+                "thank them warmly, say the team will follow up, and invoke "
+                "end_call — do NOT promise an email in that case."
+            )
+
+        followup_type = "info_request" if reason == "info_request" else "busy"
+        self.outcome["followup_requested"] = True
+        self.outcome["followup_email"] = clean
+        self.outcome["followup_type"] = followup_type
+        # Non-destructive: don't overwrite an existing booked summary.
+        if not self.outcome.get("summary"):
+            self.outcome["summary"] = (
+                f"Follow-up intro email requested ({followup_type})."
+            )
+        self.outcome["follow_up_required"] = True
+        logger.info(
+            "followup email: stored email=%s type=%s (will be sent by n8n "
+            "Flow B after end_call)",
+            clean, followup_type,
+        )
+        return (
+            "[TOOL RESULT — do not read aloud] Follow-up email address "
+            f"stored ({clean}). Say naturally to the prospect: "
+            f"'Perfect — I'll send that brief intro to {clean} right after "
+            "we hang up. Thanks so much for your time, have a great day!' "
             "Then invoke end_call."
         )
 
@@ -755,6 +802,25 @@ async def _dial_prospect(ctx: JobContext, *, lead: dict, sip_identity: str) -> b
 
 
 # ---------------------------------------------------------------------------
+# Worker prewarm (Phase 3 = wiring, Phase 4 = VAD)
+# ---------------------------------------------------------------------------
+# LiveKit invokes this once per child worker process, right after the process
+# starts and before it accepts a job. Phase 4 loads the Silero VAD model here
+# (the SDK's own documented pattern — silero.VAD.load() explicitly recommends
+# calling it inside prewarm()) and stashes it in proc.userdata so every job
+# handled by this warm process reuses the SAME loaded model instead of paying
+# the ONNX load cost again on every call. STT/TTS/LLM warmup are still out of
+# scope here and land in later phases (Phase 5 = TTS, Phase 6 = LLM).
+def prewarm(proc: JobProcess) -> None:
+    proc.userdata["vad"] = silero.VAD.load(
+        min_silence_duration=settings.vad_min_silence_sec
+    )
+    logger.info(
+        "prewarm: worker process ready (pid=%s), VAD loaded", os.getpid()
+    )
+
+
+# ---------------------------------------------------------------------------
 # Entrypoint
 # ---------------------------------------------------------------------------
 
@@ -768,9 +834,9 @@ async def entrypoint(ctx: JobContext):
     agent = OutboundSalesAgent(lead=lead, opening_already_spoken=True)
 
     # Build the TTS once and reuse the SAME instance for both the session and
-    # the pre-warm below. Telnyx keeps a persistent aiohttp session per TTS
-    # instance, so warming a throwaway instance (the previous approach) did
-    # nothing for the session's real TTS — the opener stayed cold (~8s).
+    # the pre-warm below. deepgram.TTS keeps a persistent connection pool per
+    # instance, so warming a throwaway instance would do nothing for the
+    # session's real TTS — the opener would stay cold.
     tts_engine = _build_tts()
     # Build STT once and reuse the SAME instance for the session and the STT
     # pre-warm below — the persistent aiohttp session (DNS/TLS/WS to the STT
@@ -778,8 +844,20 @@ async def entrypoint(ctx: JobContext):
     # the session's real stream (same lesson as the TTS pre-warm).
     stt_engine = _build_stt()
 
+    # Phase 4 — reuse the VAD model loaded once in prewarm() (proc.userdata)
+    # instead of loading it again per job. Falls back to an inline load if the
+    # cached instance is somehow unavailable (e.g. prewarm didn't run yet),
+    # so behavior is never worse than before this change — it just loses the
+    # warm-pool benefit for that one job.
+    vad_engine = ctx.proc.userdata.get("vad")
+    if vad_engine is None:
+        logger.warning(
+            "prewarm VAD missing from proc.userdata — loading inline as fallback"
+        )
+        vad_engine = silero.VAD.load(min_silence_duration=settings.vad_min_silence_sec)
+
     session = AgentSession(
-        vad=silero.VAD.load(min_silence_duration=settings.vad_min_silence_sec),
+        vad=vad_engine,
 
         stt=stt_engine,
 
@@ -919,34 +997,15 @@ async def entrypoint(ctx: JobContext):
     ctx.add_shutdown_callback(report_results)
 
     # --- Pre-warm TTS before dialling ------------------------------------
-    # Telnyx TTS has a multi-second cold-start (DNS + TLS + first WS connect)
-    # on the very first synthesis — this is why the scripted opener has been
-    # taking ~8s. We warm the SAME tts_engine the AgentSession uses with a
-    # throwaway synthesis during the SIP ring/dial wait, so that by the time
-    # session.say(opening_line) fires the connection is already live.
-    #
-    # Notes:
-    #   - Telnyx.prewarm() is a no-op upstream, so we must actually synthesise.
-    #   - Deepgram is fast on first use and its behaviour must stay unchanged,
-    #     so we skip it entirely.
-    #   - The throwaway audio is consumed and discarded here; it never reaches
-    #     the caller, and because it runs on the raw TTS engine (not through
-    #     the AgentSession), it does not emit any turn/latency metrics.
-    #   - Runs once per session (this entrypoint runs once per job).
-    async def _prewarm_tts() -> None:
-        if settings.tts_backend != "telnyx":
-            logger.info("TTS prewarm skipped")
-            return
-        logger.info("TTS prewarm started")
-        try:
-            async with tts_engine.synthesize(" ") as stream:
-                async for _ in stream:
-                    break  # one frame is enough to establish the connection
-            logger.info("TTS prewarm finished")
-        except Exception:
-            logger.warning("TTS prewarm failed (non-fatal)")
-
-    asyncio.create_task(_prewarm_tts())
+    # deepgram.TTS.prewarm() is a real (non-no-op) SDK override: it opens the
+    # WS connection in the background via its ConnectionPool, so calling it
+    # here during the SIP ring/dial wait means the connection is already live
+    # by the time session.say(opening_line) fires. It's synchronous but
+    # non-blocking — it just schedules the connect as a background task on
+    # the running loop, so no asyncio.create_task/try-except wrapper needed.
+    # Runs once per session (this entrypoint runs once per job).
+    logger.info("TTS prewarm requested")
+    tts_engine.prewarm()
 
     # --- Pre-warm STT before dialling ------------------------------------
     # The STT websocket/model has a cold-start (~3s transcription delay) on the
@@ -1006,6 +1065,35 @@ async def entrypoint(ctx: JobContext):
                     pass
 
     asyncio.create_task(_prewarm_stt())
+
+    # --- Pre-warm the primary Groq LLM connection before dialling ----------
+    # Neither groq.LLM nor openai.LLM (which Groq subclasses) override the
+    # base SDK's LLM.prewarm() — verified: 'prewarm' not in groq.LLM.__dict__
+    # / openai.LLM.__dict__, both inherit the base no-op `pass`. The
+    # framework never calls it automatically either. SDK v1.6.4 exposes no
+    # public warmup API for LLM, so the only way to actually open the
+    # DNS/TCP/TLS connection ahead of time is a real request. We use a
+    # throwaway Groq-only client (_build_groq_warmup_client — never the
+    # session's real LLM, never OpenAI, never the FallbackAdapter) and the
+    # smallest public call available: models.list(), a metadata GET that
+    # consumes no prompt tokens and touches no chat state. Accessing the
+    # private _client attribute is unavoidable here since models.list() is
+    # not exposed on the plugin's LLM wrapper itself, only on the underlying
+    # openai.AsyncClient.
+    async def _prewarm_llm() -> None:
+        warmup_client = _build_groq_warmup_client()
+        if warmup_client is None:
+            return
+        logger.info("LLM prewarm started")
+        try:
+            await warmup_client._client.models.list()
+            logger.info("LLM prewarm finished")
+        except Exception:
+            logger.warning("LLM prewarm failed (non-fatal)")
+        finally:
+            await warmup_client.aclose()
+
+    asyncio.create_task(_prewarm_llm())
 
     # --- Place the call and wait for a real answer ------------------------
     if not await _dial_prospect(ctx, lead=lead, sip_identity=sip_identity):
@@ -1137,6 +1225,8 @@ if __name__ == "__main__":
     cli.run_app(
         WorkerOptions(
             entrypoint_fnc=entrypoint,
+            prewarm_fnc=prewarm,
+            num_idle_processes=ServerEnvOption(dev_default=0, prod_default=2),
             agent_name=settings.agent_name,
         )
     )

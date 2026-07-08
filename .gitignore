@@ -175,3 +175,6 @@ connection_string.local
 # ============================================================================
 .git/
 .gitkeep
+
+client_secret.json
+client_secret_2.json

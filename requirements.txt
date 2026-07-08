@@ -40,7 +40,6 @@ livekit-api==1.1.0
 livekit-blingfire==1.1.0
 livekit-local-inference==0.2.6
 livekit-plugins-deepgram==1.5.17
-livekit-plugins-gladia==1.6.4
 livekit-plugins-groq==1.6.4
 livekit-plugins-openai==1.6.4
 livekit-plugins-silero==1.5.17

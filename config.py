@@ -151,18 +151,14 @@ class Settings:
 
     # --- STT ---
     stt_backend: str
-    stt_model: str          # Gladia: "solaria-1" | "solaria-2"
-    stt_language: str       # BCP-47, e.g. "en" or "en-US" (locale suffix stripped for Gladia)
+    stt_model: str
+    stt_language: str       # BCP-47, e.g. "en" or "en-US"
     stt_interim_results: bool
-    stt_no_delay: bool      # Deepgram-only; kept for rollback compatibility
-    stt_smart_format: bool  # Deepgram-only; kept for rollback compatibility
-    stt_filler_words: bool  # Deepgram-only; kept for rollback compatibility
-    stt_punctuate: bool     # Deepgram-only; kept for rollback compatibility
-    stt_endpointing_ms: int              # ms of silence before turn commit (Gladia: /1000 → seconds)
-    stt_max_duration_no_eos_sec: float   # Gladia: maximum_duration_without_endpointing
-    stt_region: str                      # Gladia: "us-west" | "eu-west"
-    stt_audio_enhancer: bool             # Gladia: pre_processing_audio_enhancer
-    stt_speech_threshold: float          # Gladia: pre_processing_speech_threshold (0.0–1.0)
+    stt_no_delay: bool      # Deepgram-only
+    stt_smart_format: bool  # Deepgram-only
+    stt_filler_words: bool  # Deepgram-only
+    stt_punctuate: bool     # Deepgram-only
+    stt_endpointing_ms: int              # ms of silence before turn commit
 
     # --- TTS ---
     tts_backend: str
@@ -294,10 +290,6 @@ def _load_settings() -> Settings:
         stt_filler_words=_require_bool("STT_FILLER_WORDS"),
         stt_punctuate=_require_bool("STT_PUNCTUATE"),
         stt_endpointing_ms=_require_int("STT_ENDPOINTING_MS"),
-        stt_max_duration_no_eos_sec=float(_raw("STT_MAX_DURATION_NO_EOS_S") or "10"),
-        stt_region=_raw("STT_REGION") or "eu-west",
-        stt_audio_enhancer=(_raw("STT_AUDIO_ENHANCER") or "false").lower() in ("1", "true", "yes", "on"),
-        stt_speech_threshold=float(_raw("STT_SPEECH_THRESHOLD") or "0.6"),
         tts_backend=tts_backend,
         tts_voice=tts_voice,
         telnyx_tts_voice=telnyx_tts_voice,

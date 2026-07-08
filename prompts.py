@@ -21,10 +21,14 @@ Contract (unchanged, drop-in compatible)
 - Style:      1-2 short sentences per turn; this is a phone call.
 """
 
+import functools
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from config import settings
+
+# Bumped when static prompt sections change — keeps Groq prompt_cache_key aligned.
+PROMPT_STATIC_VERSION = "v1"
 
 DEFAULT_PROSPECT_TZ = settings.prospect_tz
 
@@ -194,15 +198,26 @@ Never argue, never push. Stay warm and curious.
                                    people still hunt for info or build reports by hand?"
    - "We're happy / not interested" -> acknowledge, ask ONE light question; if it's a
                                    firm no, thank them and invoke end_call.
-   - "Send me an email"         -> "Happy to. So it's actually useful — what's the one
-                                   thing you'd want it to solve?" then offer the call.
+   - "Send me an email / send info" -> "Happy to send a brief intro. What's the
+                                   best email address?" Get it, read it back to
+                                   confirm, then silently invoke
+                                   capture_followup_email(email=<confirmed>, reason="info_request").
+                                   After the tool result, deliver the goodbye it
+                                   instructs and invoke end_call. Never claim
+                                   an email is sent without calling the tool.
    - "Too busy / in a meeting / driving / can't talk / call later" -> do NOT end
                                    immediately. Acknowledge, then ask ONE callback
                                    question ("When would be a better time to reach
                                    you?"). If they give a time: confirm it naturally,
-                                   thank them, invoke end_call. If they refuse any
-                                   future call or aren't interested: acknowledge,
-                                   invoke end_call. Never ask more than one, never push.
+                                   thank them, invoke end_call. If they refuse a
+                                   callback but would like info by email: offer a
+                                   brief intro, get the email, read it back to
+                                   confirm, then invoke
+                                   capture_followup_email(email=<confirmed>, reason="busy"),
+                                   deliver the tool's goodbye, and invoke end_call.
+                                   If they refuse any future contact or aren't
+                                   interested: acknowledge, invoke end_call.
+                                   Never ask more than one callback question, never push.
    - "Already have SAP/Power BI/Copilot/Salesforce" -> "Perfect, we sit on top of that —
                                    where does it still fall short for your team?"
    - "Already have consultants / it's automated" -> acknowledge, ask where gaps remain.
@@ -280,10 +295,15 @@ running.
 #  14. TOOL USAGE                                                          #
 # ======================================================================== #
 TOOLS = f"""\
-   - Available tools: get_available_slots, book_meeting, end_call. Nothing else.
+   - Available tools: get_available_slots, book_meeting, capture_followup_email,
+     end_call. Nothing else.
    - Execute tools silently — never speak their names or write syntax aloud.
    - Tool results are private instructions — paraphrase in your own words only.
-   - Never invent slots, customers, or pricing. Never collect payment data."""
+   - Never invent slots, customers, or pricing. Never collect payment data.
+   - Follow-up email is NOT a booking: only invoke capture_followup_email when
+     the prospect is busy/refuses a callback OR asks to receive information.
+     Never invoke it after a successful booking (Cal.com already emailed them).
+     Never invoke it on voicemail, hostile calls, wrong-number, or after opt-out."""
 
 # ======================================================================== #
 #  15. TONE & LANGUAGE RULES                                               #
@@ -318,72 +338,21 @@ EDGE_CASES = f"""\
 # ======================================================================== #
 #  18. build_instructions()                                                #
 # ======================================================================== #
-def build_instructions(lead: dict, *, opening_already_spoken: bool = False) -> str:
-    """Assemble the full system prompt for one outbound call."""
-    tz = ZoneInfo(lead.get("timezone", DEFAULT_PROSPECT_TZ))
-    now_local = datetime.now(tz).strftime("%A, %B %d, %Y, %I:%M %p")
+@functools.lru_cache(maxsize=16)
+def _static_instructions(industry_key: str, opening_already_spoken: bool) -> str:
+    """Immutable playbook body — identical across calls with the same industry.
 
-    name = lead.get("name", "there")
-    company = lead.get("company", "their company")
-    industry = (lead.get("industry", "") or "").strip()
-    notes = lead.get("notes", "")
-    trigger = lead.get("trigger_type", "new")
-    attempt = lead.get("call_attempt", 1)
-
-    # --- dynamic header bits ------------------------------------------------
-    industry_line = f"Industry: {industry}.\n" if industry else ""
-
-    retry_note = ""
-    if trigger in ("retry", "follow_up", "call") or attempt > 1:
-        retry_note = (
-            "FOLLOW-UP CALL: reference the prior attempt lightly and warmly, respect "
-            "their time, don't restart cold.\n"
-        )
-
-    if opening_already_spoken:
-        opener_rule = (
-            "OPENER ALREADY SPOKEN: you have greeted them by name, said you're a "
-            f"sales agent from {COMPANY}, and asked 'How are you doing today?'. "
-            "Do NOT re-introduce or repeat the greeting. "
-            "NEXT: acknowledge their answer (e.g. 'Glad to hear it'), add ONE "
-            "short rapport line that earns permission (e.g. 'Hope I'm not catching "
-            "you at a bad time.'). Once they give you a moment, ask ONE discovery "
-            "question BEFORE explaining anything — e.g. 'Just out of curiosity, how "
-            "are your finance or ops teams currently getting their reports?'. Only "
-            f"AFTER they share something do you say what {COMPANY} does and tie it "
-            "to their answer — never pitch first. If they're busy or can't talk, "
-            "use the 'busy / call later' rule below; do NOT end the call before "
-            "asking about a better time.\n"
-        )
-    else:
-        opener_rule = (
-            f"FIRST TURN: warmly confirm you're speaking with {name}, identify as an Sales Representative "
-            f"calling from {COMPANY}, then earn permission with a light, varied "
-            "opener:\n"
-            '   - "Did I catch you at an okay time?"\n'
-            '   - "Have I interrupted anything?"\n'
-            '   - "Can I borrow 30 seconds to tell you why I called?"\n'
-            "If they're busy, don't end yet — ask ONE callback question first "
-            "(see the 'busy / call later' rule below).\n"
-        )
-
-    notes_line = f"Lead notes: {notes}\n" if notes else ""
-
-    # --- industry-specific guidance ----------------------------------------
+    Placed BEFORE per-call context so the longest shared prefix is cache-friendly
+    for Groq/OpenAI prompt caching (dynamic lead fields are appended after this).
+    """
     industry_play = INDUSTRY_PLAYBOOKS.get(
-        industry.lower(),
+        industry_key,
         "No specific playbook — discover their world first, then map to a product.",
     )
-
-    # --- product reference --------------------------------------------------
     product_block = "\n".join(f"   - {k}: {v}" for k, v in PRODUCTS.items())
     outcomes_block = "\n".join(f"   - {o}" for o in OUTCOMES)
 
-    # --- assemble -----------------------------------------------------------
     return f"""\
-You are {CALLER_NAME}, a senior consultative sales consultant for {COMPANY}, on a live
-phone call with {name} at {company}. Their local time: {now_local} ({tz.key}).
-{industry_line}{retry_note}{opener_rule}{notes_line}
 # CONVERSATION PHILOSOPHY
 {PHILOSOPHY}
 
@@ -451,6 +420,67 @@ phone call with {name} at {company}. Their local time: {now_local} ({tz.key}).
 Never claim to be human. Never invent slots, customers, or pricing. No payment data.
 Deep tech/pricing -> specialist on the discovery call. Site: {WEBSITE} | {EMAIL}
 """
+
+
+def build_instructions(lead: dict, *, opening_already_spoken: bool = False) -> str:
+    """Assemble the full system prompt for one outbound call."""
+    tz = ZoneInfo(lead.get("timezone", DEFAULT_PROSPECT_TZ))
+    now_local = datetime.now(tz).strftime("%A, %B %d, %Y, %I:%M %p")
+
+    name = lead.get("name", "there")
+    company = lead.get("company", "their company")
+    industry = (lead.get("industry", "") or "").strip()
+    notes = lead.get("notes", "")
+    trigger = lead.get("trigger_type", "new")
+    attempt = lead.get("call_attempt", 1)
+
+    industry_line = f"Industry: {industry}.\n" if industry else ""
+
+    retry_note = ""
+    if trigger in ("retry", "follow_up", "call") or attempt > 1:
+        retry_note = (
+            "FOLLOW-UP CALL: reference the prior attempt lightly and warmly, respect "
+            "their time, don't restart cold.\n"
+        )
+
+    if opening_already_spoken:
+        opener_rule = (
+            "OPENER ALREADY SPOKEN: you have greeted them by name, said you're a "
+            f"sales agent from {COMPANY}, and asked 'How are you doing today?'. "
+            "Do NOT re-introduce or repeat the greeting. "
+            "NEXT: acknowledge their answer (e.g. 'Glad to hear it'), add ONE "
+            "short rapport line that earns permission (e.g. 'Hope I'm not catching "
+            "you at a bad time.'). Once they give you a moment, ask ONE discovery "
+            "question BEFORE explaining anything — e.g. 'Just out of curiosity, how "
+            "are your finance or ops teams currently getting their reports?'. Only "
+            f"AFTER they share something do you say what {COMPANY} does and tie it "
+            "to their answer — never pitch first. If they're busy or can't talk, "
+            "use the 'busy / call later' rule below; do NOT end the call before "
+            "asking about a better time.\n"
+        )
+    else:
+        opener_rule = (
+            f"FIRST TURN: warmly confirm you're speaking with {name}, identify as an Sales Representative "
+            f"calling from {COMPANY}, then earn permission with a light, varied "
+            "opener:\n"
+            '   - "Did I catch you at an okay time?"\n'
+            '   - "Have I interrupted anything?"\n'
+            '   - "Can I borrow 30 seconds to tell you why I called?"\n'
+            "If they're busy, don't end yet — ask ONE callback question first "
+            "(see the 'busy / call later' rule below).\n"
+        )
+
+    notes_line = f"Lead notes: {notes}\n" if notes else ""
+
+    static = _static_instructions(industry.lower(), opening_already_spoken)
+    call_context = (
+        f"# CALL CONTEXT (this call only)\n"
+        f"You are {CALLER_NAME}, a senior consultative sales consultant for {COMPANY}, "
+        f"on a live phone call with {name} at {company}. "
+        f"Their local time: {now_local} ({tz.key}).\n"
+        f"{industry_line}{retry_note}{opener_rule}{notes_line}"
+    )
+    return f"{static}\n{call_context}"
 
 
 # testing purpose  ----------------------------------------------------------------------- #

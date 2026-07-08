@@ -5,7 +5,7 @@ Verifies, in order:
   1. All required env vars are present (via config.py validation).
   2. LiveKit credentials work (list_rooms succeeds).
   3. Cal.com API key works AND has at least one slot in the next 5 days.
-  4. Gladia and OpenAI keys are non-empty (full network check is overkill;
+  4. OpenAI key is non-empty (full network check is overkill;
      LiveKit will surface real auth errors on first call).
   5. Google Sheets service account can read the lead sheet.
   6. SIP outbound trunk id is set and format-valid (ST_xxxx).
