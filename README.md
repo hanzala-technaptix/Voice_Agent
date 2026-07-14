@@ -1,191 +1,366 @@
 # Technaptix Voice Agent
 
-Outbound AI voice agent: leads in Google Sheets → SIP phone dial → LiveKit AI conversation → Cal.com booking → transcript and outcome back to the sheet.
+Outbound AI voice agent that automates outbound sales calls using LiveKit SIP, Deepgram, Groq, Google Sheets, n8n, and Cal.com.
 
-**No browser links. No Retell.** Direct PSTN via LiveKit SIP trunk.
+**Workflow:** Leads in Google Sheets → SIP phone call → LiveKit AI conversation → Cal.com booking → Transcript and call outcome written back to Google Sheets.
+
+**No browser links. No Retell.** Direct PSTN calling through LiveKit SIP.
 
 ---
 
-## Architecture
+# Architecture
 
-```
+```text
 Google Sheet (Lead)
        │
        ▼
-  n8n Flow A ──POST /call──► dispatch.py ──SIP──► prospect's phone rings
+  n8n Flow A ──POST /call──► dispatch.py ──SIP──► Prospect's phone
        │                            │
        │                            ▼
-       │                      agent.py (Groq LLM + Deepgram STT/TTS)
+       │                  agent.py (Groq + Deepgram)
        │                            │
-       │                     Cal.com booking (mid-call)
+       │                    Cal.com booking
        │                            │
-       └◄── n8n Flow B ◄── webhook (transcript + outcome)
+       └◄──── n8n Flow B ◄── Transcript + Outcome Webhook
 ```
 
-| Layer | Component | Port |
-|-------|-----------|------|
-| CRM | Google Sheet + `lead_collector.py` | 8100 |
-| Dialer | `dispatch.py` (SIP outbound) | 8000 |
-| Voice AI | `agent.py` (LiveKit worker) | — |
-| Orchestration | n8n Flow A, B, D | — |
+| Layer      | Component                           | Port |
+| ---------- | ----------------------------------- | ---- |
+| CRM        | Google Sheets + `leads/lead_collector.py` | 8100 |
+| Dialer     | `dispatch.py`                       | 8000 |
+| Voice AI   | `agent.py`                          | —    |
+| Automation | n8n Flows A, B, D                   | —    |
 
 ---
 
-## Repo layout
+# Repository Structure
 
-| Path | Purpose |
-|------|---------|
-| `agent.py` | LiveKit agent — conversation, Cal.com tools, transcript |
-| `dispatch.py` | Creates room + agent dispatch + SIP dial |
-| `lead_collector.py` | Ingest leads into the sheet |
-| `transcript_utils.py` | Transcript flattening + outcome classification |
-| `prompts.py` | Sales script (edit `PITCH`) |
-| `tools/calcom.py` | Cal.com API client |
-| `check_setup.py` | Preflight checks — run before every demo |
-| `livekit/outbound-trunk.json` | SIP trunk template for Twilio |
-| `n8n/Flow_A_Dialer.json` | Sheet trigger → SIP dial |
-| `n8n/Flow_B_Results.json` | Webhook → update sheet + email |
-| `n8n/Flow_C_Lead_Intake.json` | Optional webhook → collector |
-| `n8n/Flow_D_Recovery.json` | Stuck-row recovery + auto-retry |
-| `n8n/Flow_E_Acquisition.json` | Optional lead acquisition webhook |
-| `config.py` | Validates required `.env` variables on import |
-
----
-
-## Prerequisites
-
-- LiveKit Cloud project + **SIP outbound trunk** (Twilio)
-- Deepgram, Groq, OpenAI, Cal.com API keys
-- Google Sheet (tab `Lead`) + service account JSON
-- n8n (self-hosted or cloud)
-- Python 3.11+
+| Path                          | Purpose                                                               |
+| ----------------------------- | --------------------------------------------------------------------- |
+| `agent.py`                    | LiveKit voice agent (conversation, tools, transcript, email, booking) |
+| `dispatch.py`                 | Creates LiveKit room, dispatches agent, initiates SIP calls           |
+| `leads/lead_collector.py`     | Imports leads into Google Sheets                                      |
+| `config.py`                   | Loads and validates environment variables                             |
+| `prompts.py`                  | System prompt and sales script                                        |
+| `transcript_utils.py`         | Transcript formatting and outcome classification                      |
+| `email_service.py`            | Sends follow-up emails                                                |
+| `email_templates.py`          | Email templates                                                       |
+| `tools/calcom.py`             | Cal.com integration                                                   |
+| `check_setup.py`              | Environment validation and preflight checks                           |
+| `livekit/outbound-trunk.json` | LiveKit SIP trunk template                                            |
+| `n8n/Flow_A_Dialer.json`      | Google Sheets → Dial call                                             |
+| `n8n/Flow_B_Results.json`     | Store transcript and outcome                                          |
+| `n8n/Flow_C_Lead_Intake.json` | Optional public lead intake                                           |
+| `n8n/Flow_D_Recovery.json`    | Retry failed or stuck calls                                           |
 
 ---
 
-## Setup
+# Prerequisites
 
-### 1. Environment
+* Python 3.11+
+* LiveKit Cloud project
+* LiveKit SIP Outbound Trunk
+* Deepgram API Key
+* Groq API Key
+* OpenAI API Key (if configured)
+* Cal.com API Key
+* Google Sheets
+* Google Service Account
+* n8n (Cloud or Self-hosted)
+
+---
+
+# Installation
+
+## 1. Clone
 
 ```powershell
-cd voice-agent-mvp
-python -m venv venv
-.\venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-# Create .env in the project root and fill in every value (see config.py)
+git clone <repository-url>
+cd voice-agent
 ```
 
-### 2. SIP trunk (one-time)
+## 2. Create Virtual Environment
+
+```powershell
+python -m venv venv
+.\venv\Scripts\Activate.ps1
+```
+
+## 3. Install Dependencies
+
+```powershell
+pip install -r requirements.txt
+```
+
+## 4. Configure Environment
+
+Create a `.env` file in the project root and configure all required values.
+
+Configuration validation is handled automatically by `config.py`.
+
+---
+
+# LiveKit SIP Setup
+
+Create an outbound SIP trunk once.
 
 ```bash
 curl -sSL https://get.livekit.io/cli | bash
+
 lk cloud auth
-# Edit livekit/outbound-trunk.json with Twilio creds
+
+# Edit livekit/outbound-trunk.json
+
 lk sip outbound create livekit/outbound-trunk.json
-# Copy ST_xxxx → .env SIP_OUTBOUND_TRUNK_ID
 ```
 
-### 3. Google Sheet
+Copy the generated trunk ID into:
 
-Share the sheet with your service-account email (Editor). Place `service-account.json` in the project root.
-
-Header row (tab `Lead`) — `lead_collector` writes this automatically on first run:
-
-```
-Lead ID | Name | Company | Phone | Email | Source | Created At |
-Call Status | Call Outcome | Interested | Follow Up Required |
-Notes | Transcript | Call Attempt | Next Call At | Last Updated
+```text
+SIP_OUTBOUND_TRUNK_ID=ST_xxxxxxxxx
 ```
 
-**Dial triggers:** `Call Status` = `New Lead`, `Call`, `Retry`, or `Follow-up`
+---
 
-### 4. n8n
+# Google Sheets Setup
 
-Import from `n8n/`:
+Create a worksheet named:
 
-| Flow | Activate? | Role |
-|------|-----------|------|
-| Flow A | Yes | Dials on new/updated rows |
-| Flow B | Yes | Receives call results |
-| Flow C | Optional | Public lead webhook |
-| Flow D | Yes | Recovery + retries |
-| Flow E | Optional | Ingest acquisition leads |
+```text
+Lead
+```
 
-**n8n variables:** `LEAD_SHEET_ID`, `DISPATCHER_URL`, `OWNER_EMAIL`
+Share the spreadsheet with your Google Service Account.
 
-Copy Flow B production webhook URL → `.env` `N8N_RESULTS_WEBHOOK`, then restart the agent.
+Place:
 
-For acquisition, import `n8n/Flow_E_Acquisition.json`, then configure the webhook URL and point its HTTP node at `http://localhost:8200/acquire`.
+```text
+service-account.json
+```
 
-### 5. Preflight
+inside the project root.
+
+Required columns:
+
+```text
+Lead ID
+Name
+Company
+Phone
+Email
+Source
+Created At
+Call Status
+Call Outcome
+Interested
+Follow Up Required
+Notes
+Transcript
+Call Attempt
+Next Call At
+Last Updated
+```
+
+Rows with one of these statuses will be dialed:
+
+* New Lead
+* Call
+* Retry
+* Follow-up
+
+---
+
+# n8n Setup
+
+Import the workflows inside the `n8n` folder.
+
+| Workflow | Required | Purpose                                        |
+| -------- | -------- | ---------------------------------------------- |
+| Flow A   | Yes      | Starts outbound calls                          |
+| Flow B   | Yes      | Receives transcripts and updates Google Sheets |
+| Flow C   | Optional | Public lead intake endpoint                    |
+| Flow D   | Yes      | Retry and recovery workflow                    |
+
+Configure these n8n variables:
+
+```text
+LEAD_SHEET_ID
+DISPATCHER_URL
+OWNER_EMAIL
+```
+
+Copy the production webhook URL from Flow B into:
+
+```text
+N8N_RESULTS_WEBHOOK
+```
+
+Restart the agent after updating the webhook URL.
+
+---
+
+# Preflight Check
+
+Run:
 
 ```powershell
 python check_setup.py
 ```
 
-Must print `RESULT: READY ✓`.
+Expected output:
+
+```text
+RESULT: READY ✓
+```
 
 ---
 
-## Run
+# Running the System
 
-Three terminals (venv activated):
+Open three terminals.
+
+## Terminal 1 — Voice Agent
 
 ```powershell
-# Terminal 1 — agent worker
-python agent.py download-files   # first time only
+python agent.py download-files
 python agent.py start
-
-# Terminal 2 — SIP dispatcher
-uvicorn dispatch:app --host 0.0.0.0 --port 8000
-
-# Terminal 3 — lead collector (optional)
-uvicorn lead_collector:app --host 0.0.0.0 --port 8100
 ```
-Optional acquisition service:
 
-```powershell
-uvicorn lead_acquisition:app --host 0.0.0.0 --port 8200
-```
+`download-files` is only required the first time.
+
 ---
 
-## Test
+## Terminal 2 — SIP Dispatcher
 
-**Manual SIP dial:**
+```powershell
+uvicorn dispatch:app --host 0.0.0.0 --port 8000
+```
+
+---
+
+## Terminal 3 — Lead Collector (Optional)
+
+```powershell
+uvicorn leads.lead_collector:app --host 0.0.0.0 --port 8100
+```
+
+---
+
+# Testing
+
+## Manual SIP Call
 
 ```powershell
 curl -X POST http://localhost:8000/call `
   -H "Content-Type: application/json" `
-  -d '{"phone":"+1YOURPHONE","name":"Test","email":"you@example.com","lead_id":"LD-TEST01"}'
+  -d "{\"phone\":\"+1YOURPHONE\",\"name\":\"Test\",\"email\":\"you@example.com\",\"lead_id\":\"LD-TEST01\"}"
 ```
 
-Your phone rings → AI speaks → hang up → check `calls.log` and the sheet (via Flow B).
+Expected result:
 
-**Add a lead:**
+* Phone rings
+* AI starts conversation
+* Transcript generated
+* Google Sheet updated through Flow B
+
+---
+
+## Add a Lead
 
 ```powershell
 curl -X POST http://localhost:8100/leads `
   -H "Content-Type: application/json" `
-  -d '{"name":"Demo","phone":"4155551234","company":"Acme","email":"demo@test.com"}'
+  -d "{\"name\":\"Demo\",\"phone\":\"4155551234\",\"company\":\"Acme\",\"email\":\"demo@test.com\"}"
 ```
 
-Flow A picks up the new row within ~1 minute.
-
-**Rehearse without real bookings:** set `DRY_RUN=true` in `.env`, restart agent.
+Flow A automatically places the outbound call.
 
 ---
 
-## Call lifecycle
+## Dry Run
 
-```
-New Lead → Calling → (phone rings) → Booked / Declined / No Answer / Voicemail / Hung up
-                ↑                              │
-                └──────── Retry / Follow-up ◄──┘  (Flow D or manual)
+To disable real bookings:
+
+```text
+DRY_RUN=true
 ```
 
-Flow B writes: `Call Status`, `Transcript`, `Notes`, booking details.
+Restart the agent.
 
 ---
 
-## Compliance (US)
+# Call Lifecycle
 
-The agent discloses it is an AI in the first sentence. Use for invited callbacks or opted-in leads. Scrub DNC before campaigns. Two-party-consent states require recording disclosure.
+```text
+New Lead
+    │
+    ▼
+Calling
+    │
+    ▼
+Phone Rings
+    │
+    ▼
+Conversation
+    │
+    ▼
+Booked
+Declined
+Voicemail
+No Answer
+Hung Up
+    │
+    ▼
+Flow B Updates Google Sheet
+```
+
+Flow B records:
+
+* Call Status
+* Call Outcome
+* Transcript
+* Notes
+* Booking Details
+* Follow-up Information
+
+---
+
+# Logs
+
+Production logs are written under the configured log directory and include:
+
+* Call logs
+* Transcript logs
+* Latency logs
+* Email logs
+
+---
+
+# Compliance
+
+The AI identifies itself as an AI assistant at the beginning of every conversation.
+
+Before running campaigns:
+
+* Call only opted-in or invited leads.
+* Honor Do Not Call (DNC) requirements.
+* Follow applicable recording-consent laws.
+* Verify compliance with local telemarketing regulations.
+
+---
+
+# Production Components
+
+The production deployment consists of:
+
+* LiveKit Cloud
+* LiveKit SIP
+* Groq LLM
+* Deepgram STT/TTS
+* Cal.com
+* Google Sheets
+* Google Service Account
+* n8n
+* FastAPI Dispatcher
+* LiveKit Voice Agent
+* Lead Collector

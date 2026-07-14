@@ -54,7 +54,7 @@
     },
     {
       "parameters": {
-        "content": "## Flow C \u2014 Lead Intake (optional)\n\nThin webhook \u2192 calls the lead_collector service. Use it if you want to receive leads via webhook (form, Apollo + Zapier, etc.).\n\nFor a CSV / Apollo export, skip this and run:\n`python lead_collector.py import-csv leads.csv`\n\n**Env vars:**\n- `LEAD_COLLECTOR_URL` \u2014 e.g. `http://localhost:8100`",
+        "content": "## Flow C \u2014 Lead Intake (optional)\n\nThin webhook \u2192 calls the lead_collector service. Use it if you want to receive leads via webhook (form, Apollo + Zapier, etc.).\n\nFor a CSV / Apollo export, skip this and run:\n`python leads/lead_collector.py import-csv leads/leads.csv`\n\n**Env vars:**\n- `LEAD_COLLECTOR_URL` \u2014 e.g. `http://localhost:8100`",
         "height": 220,
         "width": 420,
         "color": 6

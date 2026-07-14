@@ -30,6 +30,7 @@ from livekit.agents import (
     AudioConfig,
     BackgroundAudioPlayer,
     BuiltinAudioClip,
+    FunctionToolsExecutedEvent,
     JobContext,
     JobProcess,
     MetricsCollectedEvent,
@@ -50,10 +51,70 @@ from config import ConfigurationError, settings
 from prompts import CALLER_NAME, COMPANY, build_instructions
 from tools import calcom
 from transcript_utils import classify_outcome, flatten_history
+import email_service
 
 logger = logging.getLogger("outbound-agent")
 logging.basicConfig(level=logging.INFO)
 logger.info("agent.py build: %s", settings.agent_build)
+
+# ---------------------------------------------------------------------------
+# Logging architecture — split into logs/calls.log, logs/transcripts.log,
+# logs/latency.log, logs/email.log (pure logging refactor; see "Calls log"
+# section below for the file-writing functions). Console/root logging via
+# logging.basicConfig above is untouched — these are additional file sinks,
+# not a replacement for it. Set up BEFORE validate_startup_config() below so
+# that one-time startup message also lands in logs/email.log.
+# ---------------------------------------------------------------------------
+_LOGS_DIR = "logs"
+try:
+    os.makedirs(_LOGS_DIR, exist_ok=True)
+except Exception:  # noqa: BLE001 — logging setup must never crash the worker
+    logger.exception("failed to create logs directory %r", _LOGS_DIR)
+
+_CALLS_LOG_PATH = os.path.join(_LOGS_DIR, os.path.basename(settings.calls_log_path) or "calls.log")
+_TRANSCRIPTS_LOG_PATH = os.path.join(_LOGS_DIR, "transcripts.log")
+_LATENCY_LOG_PATH = os.path.join(_LOGS_DIR, "latency.log")
+_EMAIL_LOG_PATH = os.path.join(_LOGS_DIR, "email.log")
+
+
+class _EmailLogFilter(logging.Filter):
+    """Matches only the email-workflow log records already emitted by the
+    EXISTING logger.info/warning/exception calls inside capture_followup_email
+    (this file) and process_followup_email/_send_with_retry (email_service.py).
+    No call site is touched — this filter only decides which already-emitted
+    records also get duplicated into logs/email.log."""
+
+    _PREFIXES = (
+        "EMAIL_", "EMAIL ENABLED", "followup email", "follow-up email",
+        "capture_followup_email:",
+    )
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.getMessage().startswith(self._PREFIXES)
+
+
+try:
+    _email_log_handler = logging.FileHandler(_EMAIL_LOG_PATH, encoding="utf-8")
+    _email_log_handler.setLevel(logging.INFO)
+    _email_log_handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    )
+    _email_log_handler.addFilter(_EmailLogFilter())
+    # Attached to the PARENT logger only — email_service.py's child logger
+    # ("outbound-agent.email") propagates up to it by default, so every
+    # EMAIL_CAPTURE_*/EMAIL_SEND_*/SMTP-attempt record from both files is
+    # caught here without adding a second handler.
+    logging.getLogger("outbound-agent").addHandler(_email_log_handler)
+except Exception:  # noqa: BLE001 — logging setup must never crash the worker
+    logger.exception("failed to attach logs/email.log handler")
+
+# Phase 1 (email config validation) — one clear startup log line, never per
+# call. Silent when EMAIL_ENABLED=false. See email_service.validate_startup_config.
+# This is the ONLY call site (email_service.py no longer also calls it at
+# module import time — that duplicate ran before any handler existed and its
+# message was silently lost). Runs AFTER the email.log handler is attached
+# above so this message is captured there too.
+email_service.validate_startup_config()
 
 
 def _build_turn_handling() -> TurnHandlingOptions:
@@ -210,12 +271,32 @@ class OutboundSalesAgent(Agent):
             "followup_requested": False,
             "followup_email": None,
             "followup_type": None,  # "busy" | "info_request"
+            # Which product story the conversation pointed at — set ONCE by
+            # capture_followup_email() from the model's internal PRODUCT FIT
+            # classification (prompts.py). email_service.py reads it to pick
+            # the follow-up template. Never spoken to the prospect.
+            "product_interest": "general",  # general | company | intellyca | invoyser
         }
         self.call_started_at: datetime | None = None
         self.spoke_with_human = False
         self.turn_latencies: list[dict] = []
+        # Phase 7 (telemetry, diagnostics only) — STT has no speech_id so it
+        # can't be bucketed into turn_latencies; tool timing comes from a
+        # separate SDK event. Neither changes any provider/tool behavior.
+        self.stt_metrics: list[dict] = []
+        self.tool_timings: list[dict] = []
         self._call_ended = False
         self.fake_toolcall_detected: str | None = None
+        # Phase 3 (email capture hardening) — counts failed format-validation
+        # attempts for capture_followup_email this call only; capped at
+        # _MAX_EMAIL_CAPTURE_ATTEMPTS so a bad connection can never loop forever.
+        self._email_capture_attempts = 0
+        self._email_capture_started = False
+        self._email_capture_locked = False
+        # Counts genuine unexpected exceptions inside capture_followup_email
+        # (distinct from format/domain issues, which have their own counter
+        # above) — EMAIL CAPTURE FIX #2 (guarantee execution).
+        self._email_tool_error_count = 0
 
     @staticmethod
     def _start_filler(context: RunContext, line: str) -> asyncio.Task:
@@ -298,12 +379,18 @@ class OutboundSalesAgent(Agent):
         except Exception as e:  # noqa: BLE001
             await self._finish_filler(filler)
             logger.exception("booking failed")
+            self.outcome["follow_up_required"] = True
             return (
-                f"[TOOL RESULT — do not read aloud] Booking failed. "
-                f"Error: {e}. "
-            "Say naturally: 'I'm sorry, I had a small technical issue there. "
-            "Our team will follow up with you directly by email to confirm the time.' "
-            "Then invoke end_call."
+                f"[TOOL RESULT — do not read aloud] Booking failed. Error: {e}. "
+                "Say naturally: 'I'm sorry, it looks like scheduling isn't "
+                "working right now.' Then offer a follow-up email: 'If you'd "
+                "like, I can send you our company information and product "
+                "overview by email.' If they accept, get their email, read it "
+                "back, confirm, then invoke capture_followup_email(email="
+                "<confirmed>, reason=\"info_request\", product_interest="
+                "<your PRODUCT FIT>) before invoking end_call — do NOT claim "
+                "an email was sent without calling that tool. If they decline, "
+                "thank them and invoke end_call directly."
             )
         await self._finish_filler(filler)
         self.outcome["status"] = "booked"
@@ -338,67 +425,217 @@ class OutboundSalesAgent(Agent):
         r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$"
     )
 
+    # Allowed template keys — must stay in sync with email_templates.TEMPLATES.
+    _PRODUCT_INTEREST_VALUES = frozenset({"general", "company", "intellyca", "invoyser"})
+
+    # Common consumer providers — an address on one of these needs no extra
+    # domain confirmation. Anything else (custom/company domain) must be
+    # spelled back and confirmed once before the tool will store it.
+    _KNOWN_EMAIL_DOMAINS = frozenset({
+        "gmail.com", "outlook.com", "hotmail.com", "icloud.com", "yahoo.com",
+        "proton.me", "protonmail.com", "live.com",
+    })
+
+    # Max failed format-validation attempts before giving up on this call
+    # (Phase 3 email capture hardening — never send to a guessed address).
+    _MAX_EMAIL_CAPTURE_ATTEMPTS = 3
+
+    # Max attempts for a GENUINE tool-level failure (unexpected exception),
+    # distinct from a format/domain issue — one retry, then an honest
+    # fallback message (EMAIL CAPTURE FIX #2 — guarantee execution).
+    _MAX_EMAIL_TOOL_ERROR_RETRIES = 2
+
     @function_tool()
     async def capture_followup_email(
         self,
         context: RunContext,
         email: str,
         reason: str,
+        product_interest: str = "general",
+        domain_confirmed: bool = False,
     ) -> str:
         """Store a confirmed email address for a post-call follow-up intro
-        (used ONLY when the prospect is busy or asks for information —
-        NEVER for a meeting booking, which is handled by book_meeting).
+        (used ONLY when the prospect is busy, a booking attempt failed, they
+        ask for information, or they decline but agree to a short company
+        intro — NEVER for a meeting booking, which is handled by book_meeting).
 
         Args:
             email: The prospect's confirmed email address (must be validated
                 and read back to them BEFORE calling this tool).
-            reason: Why we're sending it — must be either "busy" (they
-                couldn't talk) or "info_request" (they asked for information).
+            reason: Why we're sending it — pass "info_request" for anything
+                other than a plain busy/callback-declined case, which should
+                pass "busy". Only tunes the email's opening line.
+            product_interest: Your current internal PRODUCT FIT classification
+                for this conversation — one of "general", "company",
+                "intellyca", "invoyser". Determines which follow-up email
+                template they receive. Never speak this value aloud.
+            domain_confirmed: Set True ONLY when re-invoking after you asked
+                the prospect to spell out a custom/company email domain and
+                they confirmed it. Leave False on the first attempt.
+
+        A re-invocation with the SAME email after this call already
+        succeeded is a safe no-op (idempotent retry after a tool hiccup). A
+        re-invocation with a DIFFERENT email after success is treated as an
+        explicit correction and restarts capture for the new address — only
+        do this when the prospect explicitly said the stored address is
+        wrong. Any unexpected internal error is reported back as a distinct
+        "GENUINE TOOL FAILURE" result (never confused with a format/domain
+        request) so the model can retry once, then fail gracefully.
         """
-        # Never send a follow-up if we already booked — Cal.com emailed them.
-        if self.outcome.get("status") == "booked":
-            logger.info("followup email: refused (already booked)")
-            return (
-                "[TOOL RESULT — do not read aloud] Follow-up email is not "
-                "needed because a meeting was already booked (the calendar "
-                "invite covers the introduction). Continue the current wrap-up "
-                "and invoke end_call as planned."
-            )
+        try:
+            # Never send a follow-up if we already booked — Cal.com emailed them.
+            if self.outcome.get("status") == "booked":
+                logger.info("followup email: refused (already booked)")
+                return (
+                    "[TOOL RESULT — do not read aloud] Follow-up email is not "
+                    "needed because a meeting was already booked (the calendar "
+                    "invite covers the introduction). Continue the current wrap-up "
+                    "and invoke end_call as planned."
+                )
 
-        clean = (email or "").strip().strip(".").strip()
-        if not clean or not self._EMAIL_RE.match(clean):
-            logger.info("followup email: invalid format %r", clean[:80])
-            return (
-                "[TOOL RESULT — do not read aloud] The email address didn't "
-                "parse cleanly. Politely ask them to spell it once more, "
-                "letter by letter, then re-invoke capture_followup_email "
-                "with the corrected address. If it fails a second time, "
-                "thank them warmly, say the team will follow up, and invoke "
-                "end_call — do NOT promise an email in that case."
-            )
+            # Phase 3 (email capture hardening) — once 3 format attempts have
+            # failed on this call, refuse to try again no matter how the model
+            # re-invokes this tool; never risk sending to a guessed address.
+            if self._email_capture_locked:
+                return (
+                    "[TOOL RESULT — do not read aloud] Email capture already "
+                    "failed permanently on this call — do not try again. Deliver "
+                    "the apology you already gave and invoke end_call."
+                )
 
-        followup_type = "info_request" if reason == "info_request" else "busy"
-        self.outcome["followup_requested"] = True
-        self.outcome["followup_email"] = clean
-        self.outcome["followup_type"] = followup_type
-        # Non-destructive: don't overwrite an existing booked summary.
-        if not self.outcome.get("summary"):
-            self.outcome["summary"] = (
-                f"Follow-up intro email requested ({followup_type})."
+            clean = (email or "").strip().strip(".").strip()
+
+            # EMAIL CAPTURE FIX #2 (state protection) — a VERIFIED, already
+            # stored email is the source of truth. Same address again =
+            # idempotent retry (e.g. after a tool hiccup); a different one
+            # only reaches here because the prospect explicitly said the
+            # stored address was wrong, so the retry budget is reset for it.
+            if self.outcome.get("followup_requested"):
+                if clean and clean == self.outcome.get("followup_email"):
+                    return (
+                        "[TOOL RESULT — do not read aloud] Already stored — "
+                        "no change needed. Say naturally: 'Perfect, I've "
+                        "sent it. You should receive it shortly.' Then "
+                        "invoke end_call."
+                    )
+                logger.info(
+                    "EMAIL_CAPTURE_OVERWRITE old=%s new=%r",
+                    self.outcome.get("followup_email"), clean[:80],
+                )
+                self._email_capture_attempts = 0
+                self._email_capture_locked = False
+
+            if not self._email_capture_started:
+                self._email_capture_started = True
+                logger.info("EMAIL_CAPTURE_STARTED")
+
+            if not clean or not self._EMAIL_RE.match(clean):
+                self._email_capture_attempts += 1
+                logger.info(
+                    "EMAIL_VALIDATION_FAILED attempt=%d value=%r",
+                    self._email_capture_attempts, clean[:80],
+                )
+                if self._email_capture_attempts >= self._MAX_EMAIL_CAPTURE_ATTEMPTS:
+                    self._email_capture_locked = True
+                    logger.info(
+                        "EMAIL_CAPTURE_FAILED attempts=%d", self._email_capture_attempts
+                    )
+                    return (
+                        "[TOOL RESULT — do not read aloud] Three attempts to "
+                        "capture the email have failed. Say naturally: 'I "
+                        "apologize — I'm still not confident I captured that "
+                        "correctly, so I won't send anything rather than risk "
+                        "sending it to the wrong address.' Then invoke end_call. "
+                        "Do NOT try again."
+                    )
+                logger.info("EMAIL_CAPTURE_RETRY_%d", self._email_capture_attempts)
+                return (
+                    "[TOOL RESULT — do not read aloud] The email address didn't "
+                    f"parse cleanly (attempt {self._email_capture_attempts} of "
+                    f"{self._MAX_EMAIL_CAPTURE_ATTEMPTS}). Politely ask them to "
+                    "spell it once more, letter by letter, read it back to them, "
+                    "and get an explicit yes before re-invoking "
+                    "capture_followup_email with the corrected address. Email "
+                    "collection is still ACTIVE — do NOT invoke end_call, and do "
+                    "NOT treat a pause or partial word as them being done."
+                )
+
+            # Format is valid. Custom/company domains need one extra spelling
+            # confirmation before we store anything; common providers don't.
+            domain = clean.rsplit("@", 1)[-1].lower()
+            if domain not in self._KNOWN_EMAIL_DOMAINS and not domain_confirmed:
+                return (
+                    "[TOOL RESULT — do not read aloud] "
+                    f"'{domain}' is a custom/company domain, not a common "
+                    "provider. Before storing, say naturally: 'I heard "
+                    f"{domain} — could you please spell the domain to make sure "
+                    "I have it correct?' Once they confirm, re-invoke "
+                    "capture_followup_email with the SAME email and "
+                    "domain_confirmed=True. Do not store yet — this confirmation "
+                    "step does not count against the retry limit. Email "
+                    "collection is still ACTIVE — do NOT invoke end_call while "
+                    "waiting for them to spell the domain."
+                )
+            if domain not in self._KNOWN_EMAIL_DOMAINS:
+                logger.info("EMAIL_DOMAIN_CONFIRMED domain=%s", domain)
+
+            followup_type = "info_request" if reason == "info_request" else "busy"
+            # Persist the model's product classification exactly once, here at
+            # capture time (the moment enough has been learned to matter for the
+            # email). Unknown/garbage values fall back to "general" so the email
+            # template lookup can never fail.
+            pi = (product_interest or "general").strip().lower()
+            if pi not in self._PRODUCT_INTEREST_VALUES:
+                pi = "general"
+            self.outcome["product_interest"] = pi
+            self.outcome["followup_requested"] = True
+            self.outcome["followup_email"] = clean
+            self.outcome["followup_type"] = followup_type
+            # Non-destructive: don't overwrite an existing booked summary.
+            if not self.outcome.get("summary"):
+                self.outcome["summary"] = (
+                    f"Follow-up intro email requested ({followup_type})."
+                )
+            self.outcome["follow_up_required"] = True
+            logger.info(
+                "EMAIL_CAPTURE_SUCCESS email=%s type=%s product=%s",
+                clean, followup_type, pi,
             )
-        self.outcome["follow_up_required"] = True
-        logger.info(
-            "followup email: stored email=%s type=%s (will be sent by n8n "
-            "Flow B after end_call)",
-            clean, followup_type,
-        )
-        return (
-            "[TOOL RESULT — do not read aloud] Follow-up email address "
-            f"stored ({clean}). Say naturally to the prospect: "
-            f"'Perfect — I'll send that brief intro to {clean} right after "
-            "we hang up. Thanks so much for your time, have a great day!' "
-            "Then invoke end_call."
-        )
+            return (
+                "[TOOL RESULT — do not read aloud] Follow-up email address "
+                f"stored ({clean}). Say naturally to the prospect: "
+                f"'Perfect — I'll send that brief intro to {clean} right after "
+                "we hang up. Thanks so much for your time, have a great day!' "
+                "Then invoke end_call."
+            )
+        except Exception:  # noqa: BLE001 — EMAIL CAPTURE FIX #2 (tool failure
+            # handling): this tool has no I/O and should never raise, but if
+            # something unexpected does go wrong, fail gracefully instead of
+            # crashing the turn — never silently lose a verified email.
+            self._email_tool_error_count += 1
+            logger.exception(
+                "capture_followup_email: unexpected internal error (attempt %d/%d)",
+                self._email_tool_error_count, self._MAX_EMAIL_TOOL_ERROR_RETRIES,
+            )
+            if self._email_tool_error_count >= self._MAX_EMAIL_TOOL_ERROR_RETRIES:
+                self._email_capture_locked = True
+                return (
+                    "[TOOL RESULT — do not read aloud] GENUINE TOOL FAILURE "
+                    "(not a formatting/domain request) — a second attempt "
+                    "also failed. Say naturally: 'I'm sorry, we're having a "
+                    "temporary issue sending emails right now. Someone from "
+                    "our team will make sure you receive the information.' "
+                    "Then invoke end_call. Do NOT claim it was sent."
+                )
+            return (
+                "[TOOL RESULT — do not read aloud] GENUINE TOOL FAILURE (not "
+                "a formatting/domain request) — an unexpected problem "
+                "occurred while storing this. Say naturally: 'I'm sorry, "
+                "I'm having a little trouble sending that right now.' Then "
+                "immediately re-invoke capture_followup_email with the exact "
+                "same email, reason, and product_interest. Do NOT invoke "
+                "end_call yet — this is not the final failure."
+            )
 
     @function_tool()
     async def end_call(self, context: RunContext) -> str:
@@ -673,26 +910,119 @@ async def _dead_air_watchdog(
         logger.exception("Dead-air watchdog crashed.")
 
 # ---------------------------------------------------------------------------
-# Calls log
+# Calls log — split into calls.log (summary) / transcripts.log / latency.log
 # ---------------------------------------------------------------------------
+# Pure logging-infrastructure refactor: report_results() still builds the
+# exact same `payload` dict as before and still calls _write_calls_log(payload)
+# exactly once, unchanged (see report_results below). Nothing about how the
+# transcript, turn_latencies, stt_metrics, or tool_timings are COMPUTED or
+# COLLECTED changes here — this only decides which file each already-computed
+# piece of `payload` is written to. Each of the three writes below has its
+# own try/except so a failure in one can never block the others or interrupt
+# report_results().
+
+def _compute_latency_summary(turn_latencies: list[dict] | None) -> dict:
+    """Small rollup of already-computed per-turn values for the calls.log
+    summary line — does not change how turn_latencies is collected."""
+    tl = turn_latencies or []
+
+    def _avg(key: str) -> float | None:
+        vals = [t.get(key) for t in tl if t.get(key) is not None]
+        return round(sum(vals) / len(vals), 3) if vals else None
+
+    return {
+        "avg_pipeline": _avg("pipeline_total"),
+        "avg_eou": _avg("eou_delay"),
+        "avg_stt": _avg("transcription_delay"),
+        "avg_llm": _avg("llm_ttft"),
+        "avg_tts": _avg("tts_ttfb"),
+    }
+
+
+def _write_transcript_log(payload: dict) -> None:
+    """Conversation-only log. transcript_text is already sanitized upstream
+    in report_results() (_sanitize_transcript) — reused as-is, not recomputed."""
+    try:
+        transcript_text = payload.get("transcript_text") or ""
+        lead = payload.get("lead") or {}
+        block = (
+            "================================================\n"
+            "Call\n"
+            f"Timestamp: {datetime.now(timezone.utc).isoformat()}\n"
+            f"Lead: {lead.get('name') or lead.get('lead_id') or 'unknown'}\n"
+            f"Phone: {lead.get('phone') or ''}\n"
+            f"Outcome: {payload.get('outcome')}\n"
+            "================================================\n\n"
+            f"{transcript_text}\n\n"
+        )
+        with open(_TRANSCRIPTS_LOG_PATH, "a", encoding="utf-8") as fh:
+            fh.write(block)
+    except Exception:  # noqa: BLE001
+        logger.exception("transcripts.log write failed")
+
+
+def _write_latency_log(payload: dict) -> None:
+    """Full per-turn latency/STT/tool-timing arrays — the detailed data that
+    used to live inside calls.log. Values are the exact objects already
+    collected by _on_metrics_collected/_on_function_tools_executed; nothing
+    about that collection changes."""
+    try:
+        turn_latencies = payload.get("turn_latencies") or []
+        pipeline_totals = [t.get("pipeline_total") for t in turn_latencies if t.get("pipeline_total") is not None]
+        record = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "lead_id": payload.get("lead", {}).get("lead_id"),
+            "duration_sec": payload.get("duration_sec"),
+            "turn_count": len(turn_latencies),
+            **_compute_latency_summary(turn_latencies),
+            "max_pipeline_total": max(pipeline_totals) if pipeline_totals else None,
+            "turn_latencies": turn_latencies,
+            "stt_metrics": payload.get("stt_metrics"),
+            "tool_timings": payload.get("tool_timings"),
+            "worker_info": payload.get("worker_info"),
+        }
+        with open(_LATENCY_LOG_PATH, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record) + "\n")
+    except Exception:  # noqa: BLE001
+        logger.exception("latency.log write failed")
+
 
 def _write_calls_log(payload: dict) -> None:
-    transcript_text = _sanitize_transcript(payload.get("transcript_text") or "")
+    """Primary operational log — one concise JSON line per completed call.
+    Full transcript now lives in transcripts.log; full per-turn latency/STT/
+    tool arrays now live in latency.log (written first, independently, below)."""
+    _write_transcript_log(payload)
+    _write_latency_log(payload)
     try:
-        with open(settings.calls_log_path, "a") as fh:
+        lead = payload.get("lead") or {}
+        turn_latencies = payload.get("turn_latencies") or []
+        transcript_text = payload.get("transcript_text") or ""
+        call_id = None
+        try:
+            call_id = get_job_context().room.name
+        except Exception:  # noqa: BLE001 — best-effort only, per "if available"
+            pass
+        with open(_CALLS_LOG_PATH, "a", encoding="utf-8") as fh:
             fh.write(json.dumps({
                 "ts": datetime.now(timezone.utc).isoformat(),
-                "lead_id": payload.get("lead", {}).get("lead_id"),
-                "phone": payload.get("lead", {}).get("phone"),
+                "call_id": call_id,
+                "lead_id": lead.get("lead_id"),
+                "phone": lead.get("phone"),
                 "outcome": payload.get("outcome"),
                 "interested": payload.get("interested"),
-                "follow_up_required": payload.get("follow_up_required"),
                 "duration_sec": payload.get("duration_sec"),
                 "summary": payload.get("summary"),
                 "transcript_len": len(transcript_text),
-                "transcript": transcript_text,
-                "transcript_turns": payload.get("transcript"),
-                "turn_latencies": payload.get("turn_latencies"),
+                "turns": len(turn_latencies),
+                **_compute_latency_summary(turn_latencies),
+                "booking": payload.get("booking"),
+                "follow_up_required": payload.get("follow_up_required"),
+                # Not yet known at this point in report_results() — the SMTP
+                # send happens after this write (see email_service call below);
+                # check logs/email.log for the definitive EMAIL_SEND_SUCCESS/
+                # EMAIL_SEND_FAILED outcome for this call.
+                "email_sent": None,
+                "worker_info": payload.get("worker_info"),
                 "agent_build": payload.get("agent_build"),
                 "fake_toolcall_detected": payload.get("fake_toolcall_detected"),
             }) + "\n")
@@ -815,6 +1145,11 @@ def prewarm(proc: JobProcess) -> None:
     proc.userdata["vad"] = silero.VAD.load(
         min_silence_duration=settings.vad_min_silence_sec
     )
+    # Phase 7 (telemetry, diagnostics only) — process-lifetime bookkeeping so
+    # entrypoint() can log worker lifecycle / process-reuse info. Purely
+    # observational: nothing here changes worker scheduling or job handling.
+    proc.userdata["worker_started_at"] = time.monotonic()
+    proc.userdata["jobs_handled"] = 0
     logger.info(
         "prewarm: worker process ready (pid=%s), VAD loaded", os.getpid()
     )
@@ -830,6 +1165,32 @@ async def entrypoint(ctx: JobContext):
     lead = json.loads(ctx.job.metadata or "{}")
     lead_ref = lead.get("lead_id") or lead.get("row_id") or "unknown"
     sip_identity = lead.get("sip_identity") or f"lead-{lead_ref}"
+
+    # Phase 7 (telemetry, diagnostics only) — worker lifecycle / process
+    # reuse. proc.userdata["jobs_handled"] is set once per process in
+    # prewarm() (Phase 3/4); incrementing it here across jobs on the same
+    # warm process is how we can tell a fresh spawn (jobs_handled_before=0)
+    # apart from a reused idle-pool process (jobs_handled_before>=1) without
+    # any SDK-native "reused" flag (RunningJobInfo doesn't expose one).
+    jobs_handled_before = ctx.proc.userdata.get("jobs_handled", 0)
+    ctx.proc.userdata["jobs_handled"] = jobs_handled_before + 1
+    worker_started_at = ctx.proc.userdata.get("worker_started_at")
+    worker_info = {
+        "pid": os.getpid(),
+        "worker_id": ctx.worker_id,
+        "jobs_handled_on_process": jobs_handled_before + 1,
+        "process_reused": jobs_handled_before > 0,
+        "process_age_sec": (
+            round(time.monotonic() - worker_started_at, 3)
+            if worker_started_at is not None else None
+        ),
+    }
+    logger.info(
+        "worker lifecycle: pid=%s jobs_handled_on_process=%d process_reused=%s "
+        "process_age_sec=%s",
+        worker_info["pid"], worker_info["jobs_handled_on_process"],
+        worker_info["process_reused"], worker_info["process_age_sec"],
+    )
 
     agent = OutboundSalesAgent(lead=lead, opening_already_spoken=True)
 
@@ -877,11 +1238,42 @@ async def entrypoint(ctx: JobContext):
     # LLM ttft          = first token from LLM
     # TTS ttfb          = first audio byte from Deepgram
     # pipeline_total    = eou + llm_ttft + tts_ttfb (excludes SIP codec lag)
+    #
+    # Phase 7 (telemetry, diagnostics only) — also surface fields the SDK
+    # already computes on every metrics event but that were being discarded:
+    #   - label: which provider actually served the request. For LLM this is
+    #     the only way to see Groq vs OpenAI FallbackAdapter behavior without
+    #     touching the adapter itself.
+    #   - connection_reused / acquire_time: cold vs warm connection signal.
+    #     Raw DNS/TCP/TLS phase timing would require instrumenting provider
+    #     client construction (event_hooks/trace extensions), which conflicts
+    #     with "must not change provider configuration" — these SDK-native
+    #     fields are the safe proxy for that signal instead.
+    # No provider behavior, prompt, or tool logic is touched by any of this.
     _turn_metrics: dict[str, dict] = {}
 
     def _on_metrics_collected(ev: MetricsCollectedEvent) -> None:
         metrics.log_metrics(ev.metrics)
         m = ev.metrics
+
+        if isinstance(m, metrics.STTMetrics):
+            # STTMetrics has no speech_id, so it can't be bucketed into the
+            # per-turn dict below — record it independently instead.
+            logger.info(
+                "stt metrics: label=%s duration=%.2fs audio_duration=%.2fs "
+                "connection_reused=%s acquire_time=%.3fs",
+                m.label, m.duration, m.audio_duration,
+                m.connection_reused, m.acquire_time,
+            )
+            agent.stt_metrics.append({
+                "label": m.label,
+                "duration": m.duration,
+                "audio_duration": m.audio_duration,
+                "connection_reused": m.connection_reused,
+                "acquire_time": m.acquire_time,
+            })
+            return
+
         sid = getattr(m, "speech_id", None)
         if sid is None:
             return
@@ -891,22 +1283,48 @@ async def entrypoint(ctx: JobContext):
             bucket["transcription_delay"] = m.transcription_delay
         elif isinstance(m, metrics.LLMMetrics):
             bucket["llm_ttft"] = m.ttft
+            bucket["llm_label"] = m.label
         elif isinstance(m, metrics.TTSMetrics):
             bucket["tts_ttfb"] = m.ttfb
+            bucket["tts_label"] = m.label
+            bucket["tts_connection_reused"] = m.connection_reused
+            bucket["tts_acquire_time"] = m.acquire_time
         if {"eou_delay", "llm_ttft", "tts_ttfb"} <= bucket.keys():
             total = bucket["eou_delay"] + bucket["llm_ttft"] + bucket["tts_ttfb"]
             logger.info(
                 "turn latency: eou=%.2fs transcription=%.2fs llm_ttft=%.2fs "
-                "tts_ttfb=%.2fs -> pipeline_total=%.2fs",
+                "(provider=%s) tts_ttfb=%.2fs (provider=%s, connection_reused=%s) "
+                "-> pipeline_total=%.2fs",
                 bucket["eou_delay"],
                 bucket.get("transcription_delay", 0.0),
                 bucket["llm_ttft"],
+                bucket.get("llm_label", "?"),
                 bucket["tts_ttfb"],
+                bucket.get("tts_label", "?"),
+                bucket.get("tts_connection_reused"),
                 total,
             )
             agent.turn_latencies.append({"speech_id": sid, "pipeline_total": total, **bucket})
 
     session.on("metrics_collected", _on_metrics_collected)
+
+    # --- Tool execution timing ----------------------------------------------
+    # Phase 7 (telemetry, diagnostics only) — observes the SDK's own
+    # function_tools_executed event; does NOT touch any tool function's
+    # internals (get_available_slots, book_meeting, capture_followup_email,
+    # end_call all remain byte-for-byte unchanged). Duration is measured from
+    # when the LLM emitted the call to when the batch finished executing.
+    def _on_function_tools_executed(ev: FunctionToolsExecutedEvent) -> None:
+        for call in ev.function_calls:
+            duration = ev.created_at - call.created_at
+            logger.info("tool executed: name=%s duration=%.3fs", call.name, duration)
+            agent.tool_timings.append({
+                "name": call.name,
+                "duration": duration,
+                "created_at": call.created_at,
+            })
+
+    session.on("function_tools_executed", _on_function_tools_executed)
 
     # --- Results reporting -------------------------------------------------
     async def report_results():
@@ -978,6 +1396,11 @@ async def entrypoint(ctx: JobContext):
             "transcript": transcript_dict,
             "transcript_text": transcript_text,
             "turn_latencies": agent.turn_latencies,
+            # Phase 7 (telemetry, diagnostics only) — additive fields, no
+            # change to any field already consumed above.
+            "stt_metrics": agent.stt_metrics,
+            "tool_timings": agent.tool_timings,
+            "worker_info": worker_info,
             "agent_build": settings.agent_build,
             "fake_toolcall_detected": agent.fake_toolcall_detected,
         }
@@ -993,6 +1416,17 @@ async def entrypoint(ctx: JobContext):
                     logger.exception("attempt %d: failed to POST results to n8n", attempt + 1)
                 await asyncio.sleep(2 ** attempt)
         logger.info("call result: %s (duration=%.1fs)", payload["outcome"], duration_sec or 0)
+
+        # --- Step 4: follow-up intro email (isolated post-call subsystem) ---
+        # Runs strictly AFTER calls.log + the n8n webhook above, inside the
+        # shutdown callback (conversation already over → zero call latency).
+        # email_service gates internally on EMAIL_ENABLED + followup_requested
+        # + followup_email and never raises; the try/except is belt-and-braces
+        # so a bug there can never interrupt worker shutdown.
+        try:
+            await email_service.process_followup_email(outcome=agent.outcome, lead=lead)
+        except Exception:  # noqa: BLE001
+            logger.warning("follow-up email processing failed (non-fatal)", exc_info=True)
 
     ctx.add_shutdown_callback(report_results)
 

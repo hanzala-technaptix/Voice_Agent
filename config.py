@@ -163,8 +163,6 @@ class Settings:
     # --- TTS ---
     tts_backend: str
     tts_voice: str | None
-    telnyx_tts_voice: str | None
-    telnyx_api_key: str | None
 
     # --- Turn-taking / latency ---
     vad_min_silence_sec: float
@@ -204,6 +202,20 @@ class Settings:
     n8n_results_max_retries: int
     n8n_results_timeout_sec: float
 
+    # --- Follow-up email (optional subsystem; disabled by default) ---
+    # All fields are optional with safe defaults so existing deployments run
+    # unchanged without adding any .env variables. See email_service.py.
+    email_enabled: bool
+    smtp_host: str
+    smtp_port: int
+    smtp_username: str
+    smtp_password: str
+    smtp_use_tls: bool
+    from_email: str
+    from_name: str
+    email_timeout_sec: float
+    email_max_retries: int
+
     watchdog_soft_limit_buffer_sec: int
     sip_dial_extra_timeout_sec: int
 
@@ -234,31 +246,18 @@ def _load_settings() -> Settings:
         )
 
     stt_backend = _require_str("STT_BACKEND").lower()
-    if stt_backend == "gladia":
-        _require_api_key("GLADIA_API_KEY")
-    elif stt_backend == "deepgram":
-        _require_api_key("DEEPGRAM_API_KEY")
-    else:
+    if stt_backend != "deepgram":
         raise ConfigurationError(
-            f"Unsupported STT_BACKEND={stt_backend!r} — expected 'deepgram' or 'gladia'"
+            f"Unsupported STT_BACKEND={stt_backend!r} — expected 'deepgram'"
         )
+    _require_api_key("DEEPGRAM_API_KEY")
 
     tts_backend = _require_str("TTS_BACKEND").lower()
-    tts_voice: str | None = None
-    telnyx_tts_voice: str | None = None
-    telnyx_api_key: str | None = None
-
-    if tts_backend == "deepgram":
-        tts_voice = _require_str("TTS_VOICE")
-    elif tts_backend == "telnyx":
-        telnyx_tts_voice = _require_str("TELNYX_TTS_VOICE")
-        telnyx_api_key = _require_api_key(
-            "TELNYX_API_KEY", "Telnyx_API_KEY", "telnyx_api_key"
-        )
-    else:
+    if tts_backend != "deepgram":
         raise ConfigurationError(
-            f"Unsupported TTS_BACKEND={tts_backend!r} — expected 'deepgram' or 'telnyx'"
+            f"Unsupported TTS_BACKEND={tts_backend!r} — expected 'deepgram'"
         )
+    tts_voice = _require_str("TTS_VOICE")
 
     return Settings(
         agent_build=_require_str("AGENT_BUILD"),
@@ -292,8 +291,6 @@ def _load_settings() -> Settings:
         stt_endpointing_ms=_require_int("STT_ENDPOINTING_MS"),
         tts_backend=tts_backend,
         tts_voice=tts_voice,
-        telnyx_tts_voice=telnyx_tts_voice,
-        telnyx_api_key=telnyx_api_key,
         # --- Kept in .env: the knobs that materially move latency/UX ---
         vad_min_silence_sec=_opt_float("VAD_MIN_SILENCE_SEC", 0.35),
         endpointing_mode=_opt_str("ENDPOINTING_MODE", "fixed"),
@@ -329,6 +326,19 @@ def _load_settings() -> Settings:
         outcome_classifier_temperature=_require_float("OUTCOME_CLASSIFIER_TEMPERATURE"),
         n8n_results_max_retries=_require_int("N8N_RESULTS_MAX_RETRIES"),
         n8n_results_timeout_sec=_require_float("N8N_RESULTS_TIMEOUT_SEC"),
+        # Follow-up email — optional, defaults keep the feature OFF and boot
+        # existing .env files unchanged (Gmail SMTP + App Password expected
+        # when enabled; see email_service.py).
+        email_enabled=_opt_bool("EMAIL_ENABLED", False),
+        smtp_host=_opt_str("SMTP_HOST", "smtp.gmail.com"),
+        smtp_port=_opt_int("SMTP_PORT", 587),
+        smtp_username=_opt_str("SMTP_USERNAME", ""),
+        smtp_password=_opt_str("SMTP_PASSWORD", ""),
+        smtp_use_tls=_opt_bool("SMTP_USE_TLS", True),
+        from_email=_opt_str("FROM_EMAIL", ""),
+        from_name=_opt_str("FROM_NAME", "Technaptix"),
+        email_timeout_sec=_opt_float("EMAIL_TIMEOUT_SEC", 15.0),
+        email_max_retries=_opt_int("EMAIL_MAX_RETRIES", 2),
         watchdog_soft_limit_buffer_sec=_require_int("WATCHDOG_SOFT_LIMIT_BUFFER_SEC"),
         sip_dial_extra_timeout_sec=_require_int("SIP_DIAL_EXTRA_TIMEOUT_SEC"),
         prospect_tz=_require_str("PROSPECT_TZ"),

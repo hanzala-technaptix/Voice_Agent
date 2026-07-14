@@ -87,9 +87,9 @@ def check_sheets() -> bool:
         fail(f"service account JSON missing at {creds_path}")
         return False
     try:
-        from lead_collector import SheetsClient
+        from leads.lead_collector import SheetsClient
     except ImportError as e:
-        fail(f"could not import lead_collector: {e}")
+        fail(f"could not import leads.lead_collector: {e}")
         return False
     try:
         sc = SheetsClient(sheet_id, os.getenv("LEAD_SHEET_TAB", "Lead"))
@@ -98,25 +98,6 @@ def check_sheets() -> bool:
         return True
     except Exception as e:  # noqa: BLE001
         fail(f"Sheets read failed: {e}")
-        return False
-
-
-def check_acquisition() -> bool:
-    """Optional check: if LUSHA_API_KEY is set, verify lead acquisition service."""
-    lusha_key = os.getenv("LUSHA_API_KEY", "").strip()
-    if not lusha_key:
-        print("  ! Lead acquisition (Lusha) not configured — skipping")
-        return True
-    try:
-        from tools import lusha
-    except ImportError as e:
-        fail(f"could not import tools.lusha: {e}")
-        return False
-    if lusha.is_configured():
-        ok(f"Lusha API key configured")
-        return True
-    else:
-        fail("Lusha API key not detected")
         return False
 
 
@@ -148,8 +129,6 @@ async def main() -> int:
     cal_ok = await check_calcom() if e_ok else False
     print("[4] Google Sheets")
     sh_ok = check_sheets()
-    print("[5] Lead Acquisition (optional)")
-    acq_ok = check_acquisition()
     print("=" * 50)
     all_ok = all([e_ok, lk_ok, cal_ok, sh_ok])
     print("RESULT:", "READY ✓" if all_ok else "NOT READY ✗")
