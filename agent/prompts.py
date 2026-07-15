@@ -26,7 +26,7 @@ import re
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from config import settings
+from core.config import settings
 
 # Bumped when static prompt sections change — keeps Groq prompt_cache_key aligned.
 PROMPT_STATIC_VERSION = "v10"  # v10: adds EMAIL_CAPTURE_STORED_ON_FILE — skip

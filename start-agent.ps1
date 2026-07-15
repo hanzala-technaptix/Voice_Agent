@@ -1,4 +1,4 @@
-# Start agent.py. Stops any existing listener on port 8081 first (LiveKit worker HTTP).
+# Start agent/worker.py. Stops any existing listener on port 8081 first (LiveKit worker HTTP).
 $ErrorActionPreference = "Stop"
 $Port = 8081
 $Root = $PSScriptRoot
@@ -13,4 +13,4 @@ foreach ($conn in Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorActi
 Start-Sleep -Seconds 1
 
 Set-Location $Root
-& "$Root\venv\Scripts\python.exe" agent.py start
+& "$Root\venv\Scripts\python.exe" -m agent.worker start

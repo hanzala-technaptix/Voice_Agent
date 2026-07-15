@@ -37,8 +37,8 @@ from dataclasses import dataclass
 from email.message import EmailMessage
 from email.utils import formataddr
 
-from config import settings
-from email_templates import RenderedEmail, render_followup
+from core.config import settings
+from post_call.email_templates import RenderedEmail, render_followup
 
 logger = logging.getLogger("outbound-agent.email")
 

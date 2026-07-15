@@ -4,7 +4,7 @@ International calls to Pakistan are **carrier configuration**, not application c
 
 ## Code paths (already +92-safe)
 
-- **`dispatch.py` `CallRequest._phone_e164`** — if the input starts with `+`, digits are kept as-is (e.g. `+923342092504`).
+- **`schemas/calls.py` `CallRequest._phone_e164`** — if the input starts with `+`, digits are kept as-is (e.g. `+923342092504`).
 - **n8n Flow A — Prepare Lead** — same rule: numbers starting with `+` are normalized without adding `+1`. Timezone mapping includes `'92': 'Asia/Karachi'`.
 
 Use full E.164 in the sheet, e.g. `+923342092504`, not `03342092504`.
@@ -47,4 +47,4 @@ Set in `.env`:
 SIP_WAIT_FOR_ANSWER=true
 ```
 
-Restart dispatch. Failed SIP attempts return `sip_error_code` and `sip_error_message` in the `/call` response instead of a generic `dispatched` status.
+Restart the backend. Failed SIP attempts return `sip_error_code` and `sip_error_message` in the `/call` response instead of a generic `dispatched` status.

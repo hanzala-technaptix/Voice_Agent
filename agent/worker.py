@@ -47,11 +47,12 @@ from livekit.agents.worker import ServerEnvOption
 from livekit.plugins import openai, silero
 from livekit.plugins import deepgram
 from livekit.plugins import groq
-from config import ConfigurationError, settings
-from prompts import CALLER_NAME, COMPANY, build_instructions
-from tools import calcom
-from transcript_utils import classify_outcome, flatten_history
-import email_service
+from core.exceptions import ConfigurationError
+from core.config import settings
+from agent.prompts import CALLER_NAME, COMPANY, build_instructions
+from integrations import calcom
+from post_call.transcript import classify_outcome, flatten_history
+from post_call import email_service
 
 logger = logging.getLogger("outbound-agent")
 logging.basicConfig(level=logging.INFO)

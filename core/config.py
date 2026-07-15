@@ -12,11 +12,9 @@ from dataclasses import dataclass
 
 from dotenv import load_dotenv
 
+from core.exceptions import ConfigurationError  # noqa: F401 — re-export for backward compatibility
+
 load_dotenv()
-
-
-class ConfigurationError(Exception):
-    """Raised when a required environment variable is missing or invalid."""
 
 
 def _raw(name: str) -> str | None:

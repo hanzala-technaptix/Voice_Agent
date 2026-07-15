@@ -14,10 +14,10 @@ Outbound AI voice agent that automates outbound sales calls using LiveKit SIP, D
 Google Sheet (Lead)
        │
        ▼
-  n8n Flow A ──POST /call──► dispatch.py ──SIP──► Prospect's phone
+  n8n Flow A ──POST /call──► main.py (FastAPI) ──SIP──► Prospect's phone
        │                            │
        │                            ▼
-       │                  agent.py (Groq + Deepgram)
+       │                  agent/worker.py (Groq + Deepgram)
        │                            │
        │                    Cal.com booking
        │                            │
@@ -26,10 +26,11 @@ Google Sheet (Lead)
 
 | Layer      | Component                           | Port |
 | ---------- | ----------------------------------- | ---- |
-| CRM        | Google Sheets + `leads/lead_collector.py` | 8100 |
-| Dialer     | `dispatch.py`                       | 8000 |
-| Voice AI   | `agent.py`                          | —    |
+| Backend    | `main.py` + `routes/`               | 8000 |
+| Voice AI   | `agent/worker.py`                   | —    |
 | Automation | n8n Flows A, B, D                   | —    |
+
+Flow C (`POST /leads`) is deferred until the lead collector service is restored.
 
 ---
 
@@ -37,21 +38,21 @@ Google Sheet (Lead)
 
 | Path                          | Purpose                                                               |
 | ----------------------------- | --------------------------------------------------------------------- |
-| `agent.py`                    | LiveKit voice agent (conversation, tools, transcript, email, booking) |
-| `dispatch.py`                 | Creates LiveKit room, dispatches agent, initiates SIP calls           |
-| `leads/lead_collector.py`     | Imports leads into Google Sheets                                      |
-| `config.py`                   | Loads and validates environment variables                             |
-| `prompts.py`                  | System prompt and sales script                                        |
-| `transcript_utils.py`         | Transcript formatting and outcome classification                      |
-| `email_service.py`            | Sends follow-up emails                                                |
-| `email_templates.py`          | Email templates                                                       |
-| `tools/calcom.py`             | Cal.com integration                                                   |
-| `check_setup.py`              | Environment validation and preflight checks                           |
-| `livekit/outbound-trunk.json` | LiveKit SIP trunk template                                            |
-| `n8n/Flow_A_Dialer.json`      | Google Sheets → Dial call                                             |
-| `n8n/Flow_B_Results.json`     | Store transcript and outcome                                          |
-| `n8n/Flow_C_Lead_Intake.json` | Optional public lead intake                                           |
-| `n8n/Flow_D_Recovery.json`    | Retry failed or stuck calls                                           |
+| `main.py`                     | FastAPI app entry — wires routes only                                 |
+| `routes/`                     | HTTP endpoints (`/call`, `/health`)                                  |
+| `schemas/`                    | Pydantic request/response models                                      |
+| `services/`                   | Business logic (LiveKit dispatch, etc.)                               |
+| `core/`                       | Configuration and shared exceptions                                   |
+| `agent/worker.py`             | LiveKit voice agent (conversation, tools, transcript, email, booking) |
+| `agent/prompts.py`            | System prompt and sales script                                        |
+| `post_call/`                  | Transcript, outcome classification, follow-up email                   |
+| `integrations/calcom.py`      | Cal.com integration                                                   |
+| `scripts/check_setup.py`      | Environment validation and preflight checks                           |
+| `config/livekit/outbound-trunk.json` | LiveKit SIP trunk template                                     |
+| `config/n8n/Flow_A_Dialer.json`      | Google Sheets → Dial call                                      |
+| `config/n8n/Flow_B_Results.json`     | Store transcript and outcome                                   |
+| `config/n8n/Flow_C_Lead_Intake.json` | Optional public lead intake (inactive until leads API restored) |
+| `config/n8n/Flow_D_Recovery.json`    | Retry failed or stuck calls                                    |
 
 ---
 
@@ -96,7 +97,7 @@ pip install -r requirements.txt
 
 Create a `.env` file in the project root and configure all required values.
 
-Configuration validation is handled automatically by `config.py`.
+Configuration validation is handled automatically by `core/config.py`.
 
 ---
 
@@ -109,9 +110,9 @@ curl -sSL https://get.livekit.io/cli | bash
 
 lk cloud auth
 
-# Edit livekit/outbound-trunk.json
+# Edit config/livekit/outbound-trunk.json
 
-lk sip outbound create livekit/outbound-trunk.json
+lk sip outbound create config/livekit/outbound-trunk.json
 ```
 
 Copy the generated trunk ID into:
@@ -172,7 +173,7 @@ Rows with one of these statuses will be dialed:
 
 # n8n Setup
 
-Import the workflows inside the `n8n` folder.
+Import the workflows inside the `config/n8n` folder.
 
 | Workflow | Required | Purpose                                        |
 | -------- | -------- | ---------------------------------------------- |
@@ -204,7 +205,7 @@ Restart the agent after updating the webhook URL.
 Run:
 
 ```powershell
-python check_setup.py
+python scripts/check_setup.py
 ```
 
 Expected output:
@@ -217,31 +218,29 @@ RESULT: READY ✓
 
 # Running the System
 
-Open three terminals.
+Open two terminals.
 
 ## Terminal 1 — Voice Agent
 
 ```powershell
-python agent.py download-files
-python agent.py start
+python -m agent.worker download-files
+python -m agent.worker start
 ```
 
 `download-files` is only required the first time.
 
 ---
 
-## Terminal 2 — SIP Dispatcher
+## Terminal 2 — FastAPI Backend
 
 ```powershell
-uvicorn dispatch:app --host 0.0.0.0 --port 8000
+uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
----
-
-## Terminal 3 — Lead Collector (Optional)
+Or use the helper script:
 
 ```powershell
-uvicorn leads.lead_collector:app --host 0.0.0.0 --port 8100
+.\start-backend.ps1
 ```
 
 ---
@@ -267,13 +266,9 @@ Expected result:
 
 ## Add a Lead
 
-```powershell
-curl -X POST http://localhost:8100/leads `
-  -H "Content-Type: application/json" `
-  -d "{\"name\":\"Demo\",\"phone\":\"4155551234\",\"company\":\"Acme\",\"email\":\"demo@test.com\"}"
-```
+Lead intake via `POST /leads` is deferred until the lead collector service is restored. For now, add leads directly to the Google Sheet or use n8n Flow A after manual sheet entry.
 
-Flow A automatically places the outbound call.
+When restored, leads will be available at `POST http://localhost:8000/leads` on the same backend port.
 
 ---
 

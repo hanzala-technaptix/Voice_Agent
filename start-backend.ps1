@@ -1,4 +1,4 @@
-# Start dispatch.py on port 8000. Stops any existing listener on that port first.
+# Start main.py FastAPI backend on port 8000. Stops any existing listener on that port first.
 $ErrorActionPreference = "Stop"
 $Port = 8000
 $Root = $PSScriptRoot
@@ -13,4 +13,4 @@ foreach ($conn in Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorActi
 Start-Sleep -Seconds 1
 
 Set-Location $Root
-& "$Root\venv\Scripts\python.exe" -m uvicorn dispatch:app --host 0.0.0.0 --port $Port
+& "$Root\venv\Scripts\python.exe" -m uvicorn main:app --host 0.0.0.0 --port $Port
