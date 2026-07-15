@@ -9,11 +9,12 @@ from uuid import uuid4
 from fastapi import HTTPException
 from livekit import api
 
+from core.config import settings
 from schemas.calls import CallRequest
 
 logger = logging.getLogger("dispatch")
 
-AGENT_NAME = "outbound-caller"
+AGENT_NAME = settings.agent_name
 MAX_CONCURRENT_CALLS = int(os.getenv("MAX_CONCURRENT_CALLS", "3"))
 # Only used by /health as a config sanity check — the AGENT does the dialing
 # now and reads the SIP trunk/caller-id/ring-timeout from the shared .env.
